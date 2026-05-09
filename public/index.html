@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>xLikes</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="nav-bar">
+      <button id="navLeft" class="nav-button hidden" type="button"></button>
+      <div id="navTitle" class="nav-title">状态</div>
+      <button id="navRight" class="nav-button hidden" type="button"></button>
+    </header>
+    <main id="app" class="content"></main>
+    <nav id="tabbar" class="tabbar">
+      <button class="tab active" type="button" data-tab="status">
+        <span class="tab-icon">●</span>
+        <span>状态</span>
+      </button>
+      <button class="tab" type="button" data-tab="browse">
+        <span class="tab-icon">◆</span>
+        <span>浏览</span>
+      </button>
+      <button class="tab" type="button" data-tab="tags">
+        <span class="tab-icon">#</span>
+        <span>标签</span>
+      </button>
+    </nav>
+  </div>
+  <div id="modalRoot"></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/vendor/axios.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
