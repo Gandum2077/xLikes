@@ -1,0 +1,82 @@
+name: Draft Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  draft-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "10.13.0"
+
+      - name: Read package version
+        id: package
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VERSION"
+
+      - name: Check latest release
+        id: release_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          LATEST_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName // ""' 2>/dev/null || true)"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest release tag: ${LATEST_TAG:-none}"
+
+          if [ "$LATEST_TAG" = "$VERSION" ] || [ "$LATEST_TAG" = "v$VERSION" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Latest release already matches package.json version ($VERSION)."
+            exit 0
+          fi
+
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $VERSION already exists."
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Install npm dependencies
+        if: steps.release_check.outputs.skip != 'true'
+        run: npm install --production --no-audit
+
+      - name: Package xLikes
+        if: steps.release_check.outputs.skip != 'true'
+        run: |
+          mkdir -p dist/package
+          git ls-files -z | tar --null -T - -cf - | tar -xf - -C dist/package
+          cp -R node_modules dist/package/node_modules
+          cd dist/package
+          zip -r ../xLikes.zip .
+          cd ../..
+          cp dist/xLikes.zip dist/xLikes.box
+
+      - name: Create draft release
+        if: steps.release_check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            dist/xLikes.zip \
+            dist/xLikes.box \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$VERSION" \
+            --draft \
+            --notes "Draft release for $VERSION."
