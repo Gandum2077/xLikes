@@ -856,6 +856,30 @@ function tweetMatches(tweet, query, includeArchived, minRating) {
   return true;
 }
 
+function tweetMediaDownloadState(tweet) {
+  var media = safeArray(tweet.media);
+  var hasMedia = false;
+  var allDownloaded = true;
+  media.forEach(function (item) {
+    hasMedia = true;
+    if (!item || !item.localPath) {
+      allDownloaded = false;
+    }
+  });
+  if (!hasMedia) {
+    return "";
+  }
+  return allDownloaded ? "yes" : "no";
+}
+
+function tweetMatchesMediaDownload(tweet, mode) {
+  var normalized = mode === "yes" || mode === "no" ? mode : "";
+  if (!normalized) {
+    return true;
+  }
+  return tweetMediaDownloadState(tweet) === normalized;
+}
+
 function tagCounts(tweets) {
   var counts = {};
   safeArray(tweets).forEach(function (tweet) {
@@ -1654,6 +1678,7 @@ router.post("/search", function (req, res) {
   var includeArchived = !!body.includeArchived;
   var q = String(body.q || "").trim();
   var sortMode = body.sort === "reverse" || body.sort === "random" || body.sort === "created_asc" || body.sort === "created_desc" ? body.sort : "normal";
+  var mediaDownloaded = body.mediaDownloaded === "yes" || body.mediaDownloaded === "no" ? body.mediaDownloaded : "";
   var startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.startDate || "")) ? String(body.startDate) : "";
   var endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.endDate || "")) ? String(body.endDate) : "";
   var randomSeed = String(body.randomSeed || "");
@@ -1665,7 +1690,7 @@ router.post("/search", function (req, res) {
     writeSettings(db, settings);
   }
   var all = sortSearchTweets(db.get("tweets").value().filter(function (tweet) {
-    return tweetMatches(tweet, q, includeArchived, minRating) && tweetInDateRange(tweet, startDate, endDate);
+    return tweetMatches(tweet, q, includeArchived, minRating) && tweetMatchesMediaDownload(tweet, mediaDownloaded) && tweetInDateRange(tweet, startDate, endDate);
   }), sortMode, randomSeed);
   sendOk(res, {
     items: all.slice(offset, offset + limit),
@@ -1675,6 +1700,7 @@ router.post("/search", function (req, res) {
     hasMore: offset + limit < all.length,
     history: settings.searchHistory,
     sort: sortMode,
+    mediaDownloaded: mediaDownloaded,
     randomSeed: randomSeed
   });
 });

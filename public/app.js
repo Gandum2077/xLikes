@@ -38,6 +38,7 @@
       q: "",
       includeArchived: false,
       minRating: 0,
+      mediaDownloaded: "",
       sort: "normal",
       startDate: "",
       endDate: "",
@@ -953,6 +954,9 @@
         '<div class="field" style="margin-top:0"><label>最低评分</label><select id="searchRating">',
         ratingOptions(state.search.minRating),
         "</select></div>",
+        '<div class="field" style="margin-top:0"><label>是否完成媒体下载</label><select id="searchMediaDownloaded">',
+        mediaDownloadedOptions(state.search.mediaDownloaded),
+        "</select></div>",
         '<div class="field" style="margin-top:0"><label>搜索结果排序</label><select id="searchSort">',
         searchSortOptions(state.search.sort),
         "</select></div>",
@@ -1067,16 +1071,29 @@
     }).join("");
   }
 
+  function mediaDownloadedOptions(selected) {
+    var options = [
+      ["", "不使用"],
+      ["yes", "是"],
+      ["no", "否"]
+    ];
+    return options.map(function (item) {
+      return '<option value="' + item[0] + '" ' + (selected === item[0] ? "selected" : "") + ">" + item[1] + "</option>";
+    }).join("");
+  }
+
   function performSearch(reset) {
     var input = document.getElementById("searchInput");
     var archived = document.getElementById("searchArchived");
     var rating = document.getElementById("searchRating");
+    var mediaDownloaded = document.getElementById("searchMediaDownloaded");
     var sort = document.getElementById("searchSort");
     var startDate = document.getElementById("searchStartDate");
     var endDate = document.getElementById("searchEndDate");
     state.search.q = input ? input.value.trim() : state.search.q;
     state.search.includeArchived = archived ? archived.checked : state.search.includeArchived;
     state.search.minRating = rating ? Number(rating.value || 0) : state.search.minRating;
+    state.search.mediaDownloaded = mediaDownloaded ? mediaDownloaded.value : state.search.mediaDownloaded;
     state.search.sort = sort ? sort.value : state.search.sort;
     state.search.startDate = startDate ? startDate.value : state.search.startDate;
     state.search.endDate = endDate ? endDate.value : state.search.endDate;
@@ -1099,6 +1116,7 @@
       q: state.search.q,
       includeArchived: state.search.includeArchived,
       minRating: state.search.minRating,
+      mediaDownloaded: state.search.mediaDownloaded,
       sort: state.search.sort,
       startDate: state.search.startDate,
       endDate: state.search.endDate,
