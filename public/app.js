@@ -634,7 +634,7 @@
       } else if (item.type === "video" && item.durationMs > 30000) {
         html.push('<div class="media-placeholder">视频约 ' + Math.round(item.durationMs / 1000) + ' 秒<br><button class="button secondary" type="button" data-action="download-long" data-id="' + escapeHtml(tweet.id) + '">下载视频</button></div>');
       } else if (item.status === "error") {
-        html.push('<div class="media-placeholder">下载失败：' + escapeHtml(item.error || "") + '<br><button class="button secondary" type="button" data-action="retry-media" data-id="' + escapeHtml(tweet.id) + '">重试</button></div>');
+        html.push(renderMediaError(tweet.id, item));
       } else if (item.status === "downloading") {
         html.push('<div class="media-placeholder">正在下载媒体...</div>');
       } else {
@@ -644,6 +644,22 @@
     });
     html.push("</div>");
     return html.join("");
+  }
+
+  function renderMediaError(tweetId, item) {
+    var needsRefresh = isNotFoundError(item.error || "");
+    var hint = needsRefresh ? '<div class="media-retry-warning">远端媒体返回 404。点击重试会通过 X API 重新拉取该推文的媒体信息，可能产生费用。</div>' : "";
+    return [
+      '<div class="media-placeholder">',
+      '<div>下载失败：' + escapeHtml(item.error || "") + "</div>",
+      hint,
+      '<button class="button secondary" type="button" data-action="retry-media" data-id="' + escapeHtml(tweetId) + '" data-refresh-remote="' + (needsRefresh ? "true" : "false") + '">重试</button>',
+      "</div>"
+    ].join("");
+  }
+
+  function isNotFoundError(message) {
+    return String(message || "").indexOf("404") !== -1;
   }
 
   function mediaProgressForItem(tweetId, item) {
@@ -731,21 +747,24 @@
   function shouldAutoDownload(tweet) {
     var media = tweet.media || [];
     for (var i = 0; i < media.length; i += 1) {
-      if (!media[i].localPath && media[i].status !== "deferred" && !(media[i].type === "video" && media[i].durationMs > 30000)) {
+      if (!media[i].localPath && media[i].status !== "deferred" && media[i].status !== "error" && !(media[i].type === "video" && media[i].durationMs > 30000)) {
         return true;
       }
     }
     return false;
   }
 
-  function downloadMedia(id, forceLong) {
+  function downloadMedia(id, forceLong, refreshRemote) {
     if (state.downloading[id]) {
       return;
     }
     state.downloading[id] = true;
     markMediaDownloading(id, forceLong);
     renderTweetWhenIdle(id);
-    apiPost("/api/tweets/" + encodeURIComponent(id) + "/media/download", { forceLong: !!forceLong }).then(function (data) {
+    apiPost("/api/tweets/" + encodeURIComponent(id) + "/media/download", {
+      forceLong: !!forceLong,
+      refreshRemote: !!refreshRemote
+    }).then(function (data) {
       var tweet = data && data.tweet ? data.tweet : data;
       var progress = data && data.progress ? data.progress : null;
       if (tweet) {
@@ -1355,6 +1374,7 @@
       '<div class="list">',
       '<button class="list-row" type="button" id="archiveTweet"><span>' + archivedText + "</span></button>",
       '<button class="list-row" type="button" id="showMetrics"><span>查看数据</span></button>',
+      '<button class="list-row" type="button" id="refreshAuthor"><span>刷新用户名和头像</span></button>',
       '<button class="list-row" type="button" id="openTweet"><span>用浏览器或 X App 打开</span></button>',
       "</div>",
       '<div class="modal-actions"><button class="button ghost" type="button" data-modal-close>关闭</button></div>'
@@ -1369,6 +1389,9 @@
       document.getElementById("showMetrics").onclick = function () {
         showMetrics(tweet);
       };
+      document.getElementById("refreshAuthor").onclick = function () {
+        refreshTweetAuthor(tweet);
+      };
       document.getElementById("openTweet").onclick = function () {
         apiPost("/api/tweets/" + encodeURIComponent(tweet.id) + "/open", {}).then(function (data) {
           if (!data.openedByJsbox && data.url) {
@@ -1378,6 +1401,60 @@
         }).catch(handleError);
       };
     });
+  }
+
+  function refreshTweetAuthor(tweet) {
+    var author = tweet.author || {};
+    var authorId = author.id || tweet.authorId || "";
+    if (!authorId) {
+      showToast("没有可刷新的用户 ID");
+      return;
+    }
+    apiPost("/api/users/" + encodeURIComponent(authorId) + "/refresh", {}).then(function (data) {
+      if (data && data.user) {
+        updateAuthorInState(data.user);
+      }
+      closeModal();
+      showToast("用户名和头像已刷新");
+      renderCurrentTweetView();
+    }).catch(handleError);
+  }
+
+  function updateAuthorInState(user) {
+    updateAuthorInList(state.browseItems, user);
+    updateAuthorInList(state.search.items, user);
+  }
+
+  function updateAuthorInList(list, user) {
+    var i;
+    var j;
+    var tweet;
+    var referenced;
+    for (i = 0; i < list.length; i += 1) {
+      tweet = list[i];
+      if (String(tweet.authorId || "") === String(user.id || "") || (tweet.author && String(tweet.author.id || "") === String(user.id || ""))) {
+        tweet.authorId = user.id || tweet.authorId || "";
+        tweet.author = {
+          id: user.id || "",
+          name: user.name || "",
+          username: user.username || "",
+          profileImageUrl: user.profileImageUrl || "",
+          verified: !!user.verified
+        };
+      }
+      referenced = tweet.referencedTweets || [];
+      for (j = 0; j < referenced.length; j += 1) {
+        if (referenced[j].author && String(referenced[j].author.id || "") === String(user.id || "")) {
+          referenced[j].author = {
+            id: user.id || "",
+            name: user.name || "",
+            username: user.username || "",
+            profileImageUrl: user.profileImageUrl || "",
+            verified: !!user.verified
+          };
+        }
+      }
+    }
   }
 
   function showMetrics(tweet) {
@@ -1490,7 +1567,7 @@
       return;
     }
     if (action === "download-long" || action === "retry-media") {
-      downloadMedia(id, action === "download-long");
+      downloadMedia(id, action === "download-long", action === "retry-media" && target.getAttribute("data-refresh-remote") === "true");
       return;
     }
     if (action === "image-viewer") {

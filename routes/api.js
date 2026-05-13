@@ -442,6 +442,85 @@ function fetchAuthenticatedUser(settings, db) {
   });
 }
 
+function fetchUserById(settings, db, userId) {
+  logger.info("user.refresh.request", {
+    userId: userId
+  });
+  return xRequest(settings, "get", "/2/users/" + encodeURIComponent(userId), {
+    "user.fields": "id,name,username,profile_image_url,verified"
+  }, null, db).then(function (response) {
+    var user = response.data && response.data.data ? response.data.data : {};
+    if (!user || !user.id) {
+      var err = new Error("X API 没有返回用户信息。");
+      err.statusCode = 502;
+      throw err;
+    }
+    logger.info("user.refresh.response", {
+      userId: user.id,
+      username: user.username || "",
+      name: user.name || "",
+      hasProfileImageUrl: !!user.profile_image_url
+    });
+    return user;
+  });
+}
+
+function updateAuthorObject(author, user) {
+  if (!author) {
+    author = {};
+  }
+  author.id = user.id || author.id || "";
+  author.name = user.name || "";
+  author.username = user.username || "";
+  author.profileImageUrl = user.profile_image_url || "";
+  author.verified = !!user.verified;
+  return author;
+}
+
+function updateTweetsForUser(db, settings, user) {
+  var tweets = db.get("tweets").value();
+  var updated = 0;
+  var referencedUpdated = 0;
+  safeArray(tweets).forEach(function (tweet) {
+    var authorId = tweet.authorId || (tweet.author && tweet.author.id ? tweet.author.id : "");
+    if (String(authorId) === String(user.id)) {
+      tweet.authorId = user.id;
+      tweet.author = updateAuthorObject(tweet.author, user);
+      tweet.localUpdatedAt = nowIso();
+      updated += 1;
+    }
+    safeArray(tweet.referencedTweets).forEach(function (item) {
+      if (item.author && String(item.author.id || "") === String(user.id)) {
+        item.author = updateAuthorObject(item.author, user);
+        tweet.localUpdatedAt = nowIso();
+        referencedUpdated += 1;
+      }
+    });
+  });
+  if (settings && String(settings.userId || "") === String(user.id)) {
+    updateAuthenticatedUser(settings, user);
+    writeSettings(db, settings);
+  } else {
+    db.write();
+  }
+  logger.info("user.refresh.local_update", {
+    userId: user.id,
+    updatedTweets: updated,
+    updatedReferences: referencedUpdated
+  });
+  return {
+    user: {
+      id: user.id || "",
+      name: user.name || "",
+      username: user.username || "",
+      profileImageUrl: user.profile_image_url || "",
+      verified: !!user.verified
+    },
+    updatedTweets: updated,
+    updatedReferences: referencedUpdated
+  };
+}
+
 function ensureAuthenticatedUser(settings, db) {
   if (settings.userId) {
     return Promise.resolve(settings);
@@ -623,29 +702,34 @@ function mergeMedia(existingMedia, incomingMedia) {
   return merged;
 }
 
+function applyIncomingTweet(existing, incoming, sortOrder) {
+  var oldMedia = existing.media;
+  var preserved = {
+    rating: existing.rating || 0,
+    tags: safeArray(existing.tags),
+    note: existing.note || "",
+    archived: !!existing.archived,
+    localCreatedAt: existing.localCreatedAt || nowIso(),
+    sortOrder: existing.sortOrder || sortOrder
+  };
+  Object.keys(incoming).forEach(function (key) {
+    existing[key] = incoming[key];
+  });
+  existing.rating = preserved.rating;
+  existing.tags = preserved.tags;
+  existing.note = preserved.note;
+  existing.archived = preserved.archived;
+  existing.localCreatedAt = preserved.localCreatedAt;
+  existing.sortOrder = typeof sortOrder === "number" ? sortOrder : preserved.sortOrder;
+  existing.localUpdatedAt = nowIso();
+  existing.media = mergeMedia(oldMedia, incoming.media);
+  return existing;
+}
+
 function upsertTweet(tweets, incoming, sortOrder) {
   var existing = findTweet(tweets, incoming.id);
   if (existing) {
-    var oldMedia = existing.media;
-    var preserved = {
-      rating: existing.rating || 0,
-      tags: safeArray(existing.tags),
-      note: existing.note || "",
-      archived: !!existing.archived,
-      localCreatedAt: existing.localCreatedAt || nowIso(),
-      sortOrder: existing.sortOrder || sortOrder
-    };
-    Object.keys(incoming).forEach(function (key) {
-      existing[key] = incoming[key];
-    });
-    existing.rating = preserved.rating;
-    existing.tags = preserved.tags;
-    existing.note = preserved.note;
-    existing.archived = preserved.archived;
-    existing.localCreatedAt = preserved.localCreatedAt;
-    existing.sortOrder = typeof sortOrder === "number" ? sortOrder : preserved.sortOrder;
-    existing.localUpdatedAt = nowIso();
-    existing.media = mergeMedia(oldMedia, incoming.media);
+    applyIncomingTweet(existing, incoming, sortOrder);
     return "updated";
   }
   incoming.rating = 0;
@@ -657,6 +741,43 @@ function upsertTweet(tweets, incoming, sortOrder) {
   incoming.sortOrder = sortOrder;
   tweets.push(incoming);
   return "added";
+}
+
+function tweetLookupParams() {
+  return {
+    "tweet.fields": "id,text,created_at,author_id,public_metrics,entities,attachments,referenced_tweets,conversation_id,lang,possibly_sensitive",
+    "user.fields": "id,name,username,profile_image_url,verified",
+    "media.fields": "media_key,type,url,preview_image_url,duration_ms,width,height,alt_text,variants,public_metrics",
+    expansions: "author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,referenced_tweets.id.attachments.media_keys"
+  };
+}
+
+function refreshTweetFromX(settings, db, tweet) {
+  logger.info("tweet.refresh.request", {
+    tweetId: tweet.id
+  });
+  return xRequest(settings, "get", "/2/tweets/" + encodeURIComponent(tweet.id), tweetLookupParams(), null, db).then(function (response) {
+    var body = response.data || {};
+    var includes = body.includes || {};
+    var usersById = indexBy(includes.users, "id");
+    var mediaByKey = indexBy(includes.media, "media_key");
+    var referencedById = indexBy(includes.tweets, "id");
+    var incoming;
+    if (!body.data || !body.data.id) {
+      var err = new Error("X API 没有返回推文媒体信息。");
+      err.statusCode = 502;
+      throw err;
+    }
+    incoming = normalizeTweet(body.data, usersById, mediaByKey, referencedById);
+    applyIncomingTweet(tweet, incoming);
+    db.write();
+    logger.info("tweet.refresh.response", {
+      tweetId: tweet.id,
+      mediaCount: safeArray(tweet.media).length,
+      authorId: tweet.authorId || ""
+    });
+    return tweet;
+  });
 }
 
 function likedTweetParams(nextToken, maxResults) {
@@ -1369,6 +1490,14 @@ router.get("/tweets/random", function (req, res) {
   });
 });
 
+router.post("/users/:id/refresh", function (req, res, next) {
+  var db = getDb(req);
+  var settings = getSettings(db);
+  fetchUserById(settings, db, req.params.id).then(function (user) {
+    sendOk(res, updateTweetsForUser(db, settings, user));
+  }).catch(next);
+});
+
 router.post("/tweets/:id/rating", function (req, res) {
   var db = getDb(req);
   var tweet = findTweet(db.get("tweets").value(), req.params.id);
@@ -1439,17 +1568,26 @@ router.post("/tweets/:id/archive", function (req, res) {
   sendOk(res, tweet);
 });
 
-router.post("/tweets/:id/media/download", function (req, res) {
+router.post("/tweets/:id/media/download", function (req, res, next) {
   var db = getDb(req);
+  var settings = getSettings(db);
   var tweet = findTweet(db.get("tweets").value(), req.params.id);
+  var forceLong = !!(req.body && req.body.forceLong);
+  var refreshRemote = parseBool(req.body && req.body.refreshRemote);
+  var run;
   if (!tweet) {
     res.status(404).json({ ok: false, error: "推文不存在。" });
     return;
   }
-  var job = startMediaDownloadJob(req, tweet, !!req.body.forceLong);
-  sendOk(res, {
-    tweet: tweet,
-    progress: publicMediaDownloadJob(job)
+  run = refreshRemote ? refreshTweetFromX(settings, db, tweet) : Promise.resolve(tweet);
+  run.then(function (updatedTweet) {
+    var job = startMediaDownloadJob(req, updatedTweet, forceLong);
+    sendOk(res, {
+      tweet: updatedTweet,
+      progress: publicMediaDownloadJob(job)
+    });
+  }).catch(function (err) {
+    next(err);
   });
 });
 

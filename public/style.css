@@ -546,6 +546,12 @@ button {
   font-size: 13px;
 }
 
+.media-retry-warning {
+  max-width: 320px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
 .tag-flow,
 .top-tags {
   display: flex;
