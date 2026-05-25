@@ -15,16 +15,6 @@ var HOST = process.env.HOST || "127.0.0.1";
 var PORT = process.env.PORT || 3000;
 var PUBLIC_DIR = path.join(ROOT_DIR, "public");
 var MEDIA_DIR = path.join(PUBLIC_DIR, "media");
-var isJsbox = typeof $jsbox !== "undefined";
-var jsboxAppModule = null;
-
-if (isJsbox) {
-  try {
-    jsboxAppModule = require("app");
-  } catch (err) {
-    jsboxAppModule = null;
-  }
-}
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
@@ -70,8 +60,6 @@ app.locals.db = db;
 app.locals.rootDir = ROOT_DIR;
 app.locals.publicDir = PUBLIC_DIR;
 app.locals.mediaDir = MEDIA_DIR;
-app.locals.isJsbox = isJsbox;
-app.locals.jsboxApp = jsboxAppModule;
 app.locals.logger = logger;
 
 app.use(express.json({ limit: "3mb" }));
@@ -126,7 +114,6 @@ app.listen(PORT, HOST, () => {
     host: HOST,
     port: PORT,
     url: "http://" + HOST + ":" + PORT,
-    isJsbox: typeof $jsbox !== "undefined",
     log: logger.getState()
   });
   if (typeof $jsbox !== "undefined") {

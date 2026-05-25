@@ -189,7 +189,8 @@ iOS Safari/JSBox WebView 的滚动体验必须作为重点兼容对象：
 - 评分为 1 到 5，支持清除评分。
 - 打标签弹窗包含单行输入框、已有标签联想和最多引用的十个标签快捷项。
 - 写备注弹窗使用多行文本框。
-- 右上角 ellipsis 菜单提供：归档/取消归档、查看数据、用浏览器打开、用 X App 打开。
+- 右上角 ellipsis 菜单提供：归档/取消归档、查看数据、刷新用户名和头像。
+- ellipsis 左侧显示 globe 链接按钮，使用 `https://x.com/{username}/status/{id}` 打开推文，以支持 JSBox WebView 自动跳转到 X App。
 
 ### 5.4 标签页
 
@@ -334,16 +335,13 @@ node index.js
 
 ### 9.2 打开 X App
 
-Node 初始化时需要识别是否运行在 JSBox 中。跳转 X App 时，JSBox 环境应使用 JSBox API 打开 URL scheme；普通浏览器环境使用常规链接。
+推文卡片通过标准 HTTPS 超链接打开 X 推文，链接必须包含用户名：
 
-示例：
-
-```javascript
-var isJsbox = typeof $jsbox !== "undefined";
-var app = require("app");
-
-app.openURL("twitter://status?id=2050938561504112755");
+```text
+https://x.com/{username}/status/{id}
 ```
+
+例如：`https://x.com/vikingmute/status/2058541341609709675`。不能使用 `https://x.com/i/web/status/{id}`，也不为跳转推文在 Node 端识别 JSBox 环境或调用 JSBox 特殊打开链接 API。
 
 ### 9.3 移动端限制
 

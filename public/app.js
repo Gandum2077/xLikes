@@ -558,6 +558,16 @@
     return html.join("");
   }
 
+  function renderTweetExternalLink(tweet) {
+    var author = tweet.author || {};
+    var username = String(author.username || "").replace(/^@+/, "").trim();
+    var globe = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>';
+    if (!username) {
+      return '<span class="tweet-globe disabled" title="缺少用户名，无法打开推文" aria-hidden="true">' + globe + "</span>";
+    }
+    return '<a class="tweet-globe" href="https://x.com/' + encodeURIComponent(username) + "/status/" + encodeURIComponent(tweet.id) + '" aria-label="在 X 中打开推文" title="在 X 中打开" target="_blank">' + globe + "</a>";
+  }
+
   function renderTweetCard(tweet) {
     var author = tweet.author || {};
     var metrics = tweet.publicMetrics || {};
@@ -572,7 +582,10 @@
       avatar,
       '<div><div class="tweet-name"><span>' + escapeHtml(author.name || "Unknown") + '</span></div>',
       '<div class="tweet-meta">@' + escapeHtml(author.username || "unknown") + " · " + escapeHtml(formatDate(tweet.createdAt)) + "</div></div>",
+      '<div class="tweet-head-actions">',
+      renderTweetExternalLink(tweet),
       '<button class="tweet-more" type="button" data-action="tweet-menu" data-id="' + escapeHtml(tweet.id) + '">•••</button>',
+      "</div>",
       "</div>",
       '<div class="tweet-text">' + linkifyText(tweet.text || "") + "</div>",
       quote,
@@ -1393,7 +1406,6 @@
       '<button class="list-row" type="button" id="archiveTweet"><span>' + archivedText + "</span></button>",
       '<button class="list-row" type="button" id="showMetrics"><span>查看数据</span></button>',
       '<button class="list-row" type="button" id="refreshAuthor"><span>刷新用户名和头像</span></button>',
-      '<button class="list-row" type="button" id="openTweet"><span>用浏览器或 X App 打开</span></button>',
       "</div>",
       '<div class="modal-actions"><button class="button ghost" type="button" data-modal-close>关闭</button></div>'
     ].join(""), function () {
@@ -1409,14 +1421,6 @@
       };
       document.getElementById("refreshAuthor").onclick = function () {
         refreshTweetAuthor(tweet);
-      };
-      document.getElementById("openTweet").onclick = function () {
-        apiPost("/api/tweets/" + encodeURIComponent(tweet.id) + "/open", {}).then(function (data) {
-          if (!data.openedByJsbox && data.url) {
-            window.open(data.url, "_blank");
-          }
-          closeModal();
-        }).catch(handleError);
       };
     });
   }

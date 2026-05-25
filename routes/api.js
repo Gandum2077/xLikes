@@ -14,6 +14,32 @@ var LONG_VIDEO_MS = 30000;
 var LIKED_TWEETS_INCREMENTAL_MAX_RESULTS = 5;
 var LIKED_TWEETS_FULL_MAX_RESULTS = 100;
 var LIKED_TWEETS_AUTH_TEST_MAX_RESULTS = 5;
+var TWEET_FIELDS = [
+  "id",
+  "text",
+  "note_tweet",
+  "article",
+  "display_text_range",
+  "created_at",
+  "author_id",
+  "public_metrics",
+  "entities",
+  "attachments",
+  "referenced_tweets",
+  "conversation_id",
+  "lang",
+  "possibly_sensitive"
+].join(",");
+var TWEET_EXPANSIONS = [
+  "author_id",
+  "attachments.media_keys",
+  "article.cover_media",
+  "article.media_entities",
+  "entities.note.mentions.username",
+  "referenced_tweets.id",
+  "referenced_tweets.id.author_id",
+  "referenced_tweets.id.attachments.media_keys"
+].join(",");
 var mediaDownloadJobs = {};
 var CREDENTIAL_ENV_KEYS = {
   accessToken: "X_ACCESS_TOKEN",
@@ -599,6 +625,105 @@ function selectBestVideoUrl(media) {
   return best ? best.url : "";
 }
 
+function firstNonEmptyString(values) {
+  for (var i = 0; i < values.length; i += 1) {
+    if (typeof values[i] === "string" && values[i].trim()) {
+      return values[i];
+    }
+  }
+  return "";
+}
+
+function textFromBlocks(blocks) {
+  var lines = [];
+  safeArray(blocks).forEach(function (block) {
+    if (!block || typeof block !== "object") {
+      return;
+    }
+    var text = firstNonEmptyString([
+      block.text,
+      block.body,
+      block.content,
+      block.plain_text,
+      block.plainText
+    ]);
+    if (text) {
+      lines.push(text);
+    }
+  });
+  return lines.join("\n\n");
+}
+
+function articleBodyText(article) {
+  if (!article || typeof article !== "object") {
+    return "";
+  }
+  return firstNonEmptyString([
+    article.text,
+    article.body,
+    article.content,
+    article.plain_text,
+    article.plainText,
+    article.markdown
+  ]) || textFromBlocks(article.blocks) || textFromBlocks(article.sections);
+}
+
+function articleTitle(article) {
+  if (!article || typeof article !== "object") {
+    return "";
+  }
+  return firstNonEmptyString([
+    article.title,
+    article.name,
+    article.headline
+  ]);
+}
+
+function readArticleText(article) {
+  var body = articleBodyText(article);
+  var title = articleTitle(article);
+  if (body && title && body.indexOf(title) !== 0) {
+    return title + "\n\n" + body;
+  }
+  return body;
+}
+
+function readNoteTweetText(noteTweet) {
+  if (!noteTweet || typeof noteTweet !== "object") {
+    return "";
+  }
+  return firstNonEmptyString([
+    noteTweet.text,
+    noteTweet.full_text,
+    noteTweet.fullText
+  ]);
+}
+
+// Prefer full long-form payloads over the shortened Tweet text when X returns them.
+function extractTweetText(tweet) {
+  var articleText = readArticleText(tweet.article);
+  var noteText = readNoteTweetText(tweet.note_tweet);
+  if (articleText) {
+    return {
+      text: articleText,
+      source: "article",
+      entities: tweet.article && tweet.article.entities ? tweet.article.entities : null
+    };
+  }
+  if (noteText) {
+    return {
+      text: noteText,
+      source: "note_tweet",
+      entities: tweet.note_tweet && tweet.note_tweet.entities ? tweet.note_tweet.entities : null
+    };
+  }
+  return {
+    text: tweet.text || "",
+    source: "text",
+    entities: tweet.entities || null
+  };
+}
+
 function normalizeMedia(media) {
   var type = media.type || "";
   var downloadUrl = media.url || "";
@@ -626,6 +751,7 @@ function normalizeMedia(media) {
 function normalizeTweet(tweet, usersById, mediaByKey, referencedById) {
   var media = [];
   var keys = tweet.attachments && tweet.attachments.media_keys ? tweet.attachments.media_keys : [];
+  var textInfo = extractTweetText(tweet);
   safeArray(keys).forEach(function (key) {
     if (mediaByKey[key]) {
       media.push(normalizeMedia(mediaByKey[key]));
@@ -636,10 +762,14 @@ function normalizeTweet(tweet, usersById, mediaByKey, referencedById) {
   safeArray(tweet.referenced_tweets).forEach(function (ref) {
     var related = referencedById[ref.id] || null;
     var author = related && usersById[related.author_id] ? usersById[related.author_id] : null;
+    var relatedTextInfo = related ? extractTweetText(related) : { text: "", source: "text" };
     referenced.push({
       type: ref.type || "",
       id: ref.id,
-      text: related ? related.text || "" : "",
+      text: relatedTextInfo.text,
+      textSource: relatedTextInfo.source,
+      hasLongText: !!(related && related.note_tweet),
+      hasArticle: !!(related && related.article),
       author: author ? {
         id: author.id || "",
         name: author.name || "",
@@ -652,7 +782,14 @@ function normalizeTweet(tweet, usersById, mediaByKey, referencedById) {
   var authorData = usersById[tweet.author_id] || {};
   return {
     id: tweet.id,
-    text: tweet.text || "",
+    text: textInfo.text,
+    textPreview: tweet.text || "",
+    textSource: textInfo.source,
+    hasLongText: !!tweet.note_tweet,
+    hasArticle: !!tweet.article,
+    noteTweet: tweet.note_tweet || null,
+    article: tweet.article || null,
+    displayTextRange: tweet.display_text_range || null,
     createdAt: tweet.created_at || "",
     authorId: tweet.author_id || "",
     author: {
@@ -664,6 +801,7 @@ function normalizeTweet(tweet, usersById, mediaByKey, referencedById) {
     },
     publicMetrics: tweet.public_metrics || {},
     entities: tweet.entities || null,
+    fullEntities: textInfo.entities || tweet.entities || null,
     attachments: tweet.attachments || null,
     referencedTweets: referenced,
     media: media,
@@ -745,10 +883,10 @@ function upsertTweet(tweets, incoming, sortOrder) {
 
 function tweetLookupParams() {
   return {
-    "tweet.fields": "id,text,created_at,author_id,public_metrics,entities,attachments,referenced_tweets,conversation_id,lang,possibly_sensitive",
+    "tweet.fields": TWEET_FIELDS,
     "user.fields": "id,name,username,profile_image_url,verified",
     "media.fields": "media_key,type,url,preview_image_url,duration_ms,width,height,alt_text,variants,public_metrics",
-    expansions: "author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,referenced_tweets.id.attachments.media_keys"
+    expansions: TWEET_EXPANSIONS
   };
 }
 
@@ -790,10 +928,10 @@ function likedTweetParams(nextToken, maxResults) {
   }
   var params = {
     max_results: pageSize,
-    "tweet.fields": "id,text,created_at,author_id,public_metrics,entities,attachments,referenced_tweets,conversation_id,lang,possibly_sensitive",
+    "tweet.fields": TWEET_FIELDS,
     "user.fields": "id,name,username,profile_image_url,verified",
     "media.fields": "media_key,type,url,preview_image_url,duration_ms,width,height,alt_text,variants,public_metrics",
-    expansions: "author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id,referenced_tweets.id.attachments.media_keys"
+    expansions: TWEET_EXPANSIONS
   };
   if (nextToken) {
     params.pagination_token = nextToken;
@@ -1413,8 +1551,7 @@ router.get("/status", function (req, res) {
       archivedTweets: tweets.filter(function (tweet) { return !!tweet.archived; }).length,
       taggedTweets: tweets.filter(function (tweet) { return safeArray(tweet.tags).length > 0; }).length
     },
-    sync: db.get("sync").value(),
-    isJsbox: !!req.app.locals.isJsbox
+    sync: db.get("sync").value()
   });
 });
 
@@ -1626,27 +1763,6 @@ router.get("/tweets/:id/media/progress", function (req, res) {
   sendOk(res, {
     tweet: tweet,
     progress: publicMediaDownloadJob(job)
-  });
-});
-
-router.post("/tweets/:id/open", function (req, res) {
-  var tweetId = req.params.id;
-  var webUrl = "https://x.com/i/web/status/" + encodeURIComponent(tweetId);
-  var schemeUrl = "twitter://status?id=" + encodeURIComponent(tweetId);
-  var jsboxApp = req.app.locals.jsboxApp;
-  if (req.app.locals.isJsbox && jsboxApp && typeof jsboxApp.openURL === "function") {
-    jsboxApp.openURL(schemeUrl);
-    sendOk(res, {
-      openedByJsbox: true,
-      url: webUrl,
-      schemeUrl: schemeUrl
-    });
-    return;
-  }
-  sendOk(res, {
-    openedByJsbox: false,
-    url: webUrl,
-    schemeUrl: schemeUrl
   });
 });
 

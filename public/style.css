@@ -382,7 +382,7 @@ button {
 
 .tweet-head {
   display: grid;
-  grid-template-columns: 44px 1fr 38px;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
   gap: 10px;
   align-items: start;
 }
@@ -417,6 +417,13 @@ button {
   font-size: 14px;
 }
 
+.tweet-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.tweet-globe,
 .tweet-more {
   width: 36px;
   height: 34px;
@@ -424,9 +431,25 @@ button {
   border-radius: 50%;
   color: var(--muted);
   background: transparent;
+  align-items: center;
+  justify-content: center;
+}
+
+.tweet-globe {
+  display: flex;
+  text-decoration: none;
+}
+
+.tweet-globe.disabled {
+  opacity: 0.42;
+}
+
+.tweet-more {
+  display: flex;
   font-size: 20px;
 }
 
+.tweet-globe:active,
 .tweet-more:active {
   background: var(--surface-soft);
 }
