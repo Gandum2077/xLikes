@@ -145,6 +145,18 @@
     return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
   }
 
+  function formatRateLimitReset(value) {
+    var seconds = Number(value || 0);
+    if (!seconds || !isFinite(seconds)) {
+      return "额度重置后";
+    }
+    return formatDateTime(seconds * 1000);
+  }
+
+  function resumeIsWaiting(resume) {
+    return !!(resume && Number(resume.rateLimitReset || 0) * 1000 > Date.now());
+  }
+
   function pad(value) {
     return value < 10 ? "0" + value : String(value);
   }
@@ -239,6 +251,9 @@
       return;
     }
     var sync = data.sync || {};
+    var resume = sync.resume || null;
+    var syncAction = resume ? "sync-resume" : "sync-incremental";
+    var syncLabel = resume ? "继续同步" : "增量同步";
     appEl.innerHTML = [
       '<section class="panel">',
       '<div class="row between">',
@@ -257,8 +272,13 @@
       '<section class="panel">',
       '<h3>同步</h3>',
       '<label class="switch-row"><span>启动时自动增量同步</span><input id="autoSyncToggle" type="checkbox" ' + (settings.autoSyncOnStart ? "checked" : "") + "></label>",
+      '<div class="field sync-page-size">',
+      '<label for="syncPageSizeInput">每次请求数量</label>',
+      '<input id="syncPageSizeInput" type="number" inputmode="numeric" min="5" max="100" step="1" value="' + escapeHtml(settings.syncPageSize || 100) + '" ' + (state.syncing ? "disabled" : "") + ">",
+      '<span class="field-help">可填写 5–100。数值越大，获取相同数量推文需要的请求次数越少；继续同步会沿用断点保存的数量。</span>',
+      "</div>",
       '<div class="row">',
-      '<button class="button" type="button" data-action="sync-incremental" ' + (state.syncing ? "disabled" : "") + ">增量同步</button>",
+      '<button class="button" type="button" data-action="' + syncAction + '" ' + (state.syncing ? "disabled" : "") + ">" + syncLabel + "</button>",
       '<button class="button secondary" type="button" data-action="sync-full" ' + (state.syncing ? "disabled" : "") + ">完全同步</button>",
       "</div>",
       syncHtml(sync),
@@ -285,6 +305,12 @@
         }).catch(handleError);
       };
     }
+    var pageSizeInput = document.getElementById("syncPageSizeInput");
+    if (pageSizeInput) {
+      pageSizeInput.onchange = function () {
+        saveSyncPageSize(pageSizeInput);
+      };
+    }
   }
 
   function statHtml(value, label) {
@@ -295,11 +321,26 @@
     if (state.syncing) {
       return '<div class="loading">同步进行中，请保持页面打开...</div>';
     }
+    if (sync && sync.resume) {
+      var resume = sync.resume;
+      var resetText = formatRateLimitReset(resume.rateLimitReset);
+      var timingText = resumeIsWaiting(resume) ? "请在 " + resetText + " 后点击继续同步。" : "速率限制预计已重置，可以继续同步。";
+      return [
+        '<div class="sync-warning" role="status">',
+        '<strong>同步已暂停，可从断点继续</strong>',
+        '<span>已完成 ' + escapeHtml(String(resume.pages || 0)) + " 页，新增 " + escapeHtml(String(resume.added || 0)) + " 条，更新 " + escapeHtml(String(resume.updated || 0)) + " 条；断点每次读取 " + escapeHtml(String(resume.pageSize || 0)) + " 条。</span>",
+        '<span>' + escapeHtml(timingText) + "</span>",
+        "</div>"
+      ].join("");
+    }
     if (sync && sync.lastError) {
+      if (Number(sync.lastErrorStatus || 0) === 429 && sync.lastRateLimit && sync.lastRateLimit.reset) {
+        return '<div class="sync-warning" role="status"><strong>上次同步遇到速率限制</strong><span>' + escapeHtml(sync.lastError) + '</span><span>预计重置时间：' + escapeHtml(formatRateLimitReset(sync.lastRateLimit.reset)) + "。</span></div>";
+      }
       return '<p class="inline-muted">上次同步失败：' + escapeHtml(sync.lastError) + "</p>";
     }
     if (!sync || !sync.lastSummary) {
-      return '<p class="inline-muted">尚未同步。增量同步每次只读取 5 条，遇到本地重复推文后停止；完全同步会批量遍历全部可访问点赞。</p>';
+      return '<p class="inline-muted">尚未同步。增量同步遇到本地重复推文后停止；完全同步会批量遍历全部可访问点赞。</p>';
     }
     var s = sync.lastSummary;
     return '<p class="inline-muted">上次' + (s.mode === "full" ? "完全" : "增量") + "同步：新增 " + s.added + "，更新 " + s.updated + "，页数 " + s.pages + (s.maxResults ? "，每次读取 " + s.maxResults + " 条" : "") + "。</p>";
@@ -400,23 +441,69 @@
     }).catch(handleError);
   }
 
+  function validSyncPageSize(value) {
+    var pageSize = Number(value);
+    return isFinite(pageSize) && Math.floor(pageSize) === pageSize && pageSize >= 5 && pageSize <= 100;
+  }
+
+  function saveSyncPageSize(input) {
+    var pageSize = Number(input.value);
+    if (!validSyncPageSize(pageSize)) {
+      input.value = state.status && state.status.settings ? state.status.settings.syncPageSize : 100;
+      showToast("每次请求数量必须是 5 到 100 之间的整数");
+      return Promise.resolve(false);
+    }
+    input.disabled = true;
+    return apiPost("/api/settings", { syncPageSize: pageSize }).then(function (updated) {
+      input.disabled = false;
+      if (state.status) {
+        state.status.settings = updated;
+      }
+      showToast("每次请求数量已保存");
+      return pageSize;
+    }).catch(function (err) {
+      input.disabled = false;
+      handleError(err);
+      return false;
+    });
+  }
+
   function maybeAutoSync(settings) {
     if (state.autoSyncTried || !settings.autoSyncOnStart) {
       return;
     }
     state.autoSyncTried = true;
-    runSync("incremental", true);
+    var resume = state.status && state.status.sync ? state.status.sync.resume : null;
+    if (resume && resumeIsWaiting(resume)) {
+      return;
+    }
+    runSync(resume ? "resume" : "incremental", true);
   }
 
   function runSync(mode, silent) {
+    var payload = { mode: mode };
+    var pageSizeInput = document.getElementById("syncPageSizeInput");
     if (state.syncing) {
       return;
+    }
+    if (mode === "resume") {
+      var resume = state.status && state.status.sync ? state.status.sync.resume : null;
+      if (resume && resumeIsWaiting(resume)) {
+        showToast("请在 " + formatRateLimitReset(resume.rateLimitReset) + " 后继续同步");
+        return;
+      }
+    } else if (pageSizeInput) {
+      if (!validSyncPageSize(pageSizeInput.value)) {
+        showToast("每次请求数量必须是 5 到 100 之间的整数");
+        return;
+      }
+      payload.maxResults = Number(pageSizeInput.value);
     }
     state.syncing = true;
     if (state.activeTab === "status" && !state.searchOpen) {
       renderStatus();
     }
-    apiPost("/api/sync", { mode: mode }).then(function (summary) {
+    apiPost("/api/sync", payload).then(function (summary) {
       state.syncing = false;
       if (!silent) {
         showToast("同步完成：新增 " + summary.added + "，更新 " + summary.updated);
@@ -429,8 +516,18 @@
       }
     }).catch(function (err) {
       state.syncing = false;
-      renderStatus();
-      handleError(err);
+      apiGet("/api/status").then(function (data) {
+        state.status = data;
+        if (state.activeTab === "status" && !state.searchOpen) {
+          renderStatus();
+        }
+        handleError(err);
+      }).catch(function () {
+        if (state.activeTab === "status" && !state.searchOpen) {
+          renderStatus();
+        }
+        handleError(err);
+      });
     });
   }
 
@@ -1403,12 +1500,17 @@
     showModal([
       "<h3>更多</h3>",
       '<div class="list">',
+      '<button class="list-row" type="button" id="refreshTweet"><span>重新获取内容</span></button>',
       '<button class="list-row" type="button" id="archiveTweet"><span>' + archivedText + "</span></button>",
       '<button class="list-row" type="button" id="showMetrics"><span>查看数据</span></button>',
       '<button class="list-row" type="button" id="refreshAuthor"><span>刷新用户名和头像</span></button>',
       "</div>",
+      '<p class="inline-muted">重新从 X 获取正文、长推特或文章、引用、数据和媒体信息；评分、标签、备注与归档状态会保留。</p>',
       '<div class="modal-actions"><button class="button ghost" type="button" data-modal-close>关闭</button></div>'
     ].join(""), function () {
+      document.getElementById("refreshTweet").onclick = function () {
+        refreshTweetContent(tweet, this);
+      };
       document.getElementById("archiveTweet").onclick = function () {
         apiPost("/api/tweets/" + encodeURIComponent(tweet.id) + "/archive", { archived: !tweet.archived }).then(function (updated) {
           closeModal();
@@ -1422,6 +1524,24 @@
       document.getElementById("refreshAuthor").onclick = function () {
         refreshTweetAuthor(tweet);
       };
+    });
+  }
+
+  function refreshTweetContent(tweet, button) {
+    if (button.disabled) {
+      return;
+    }
+    button.disabled = true;
+    button.querySelector("span").textContent = "正在重新获取...";
+    apiPost("/api/tweets/" + encodeURIComponent(tweet.id) + "/refresh", {}).then(function (updated) {
+      updateTweetInState(updated);
+      closeModal();
+      renderTweetInPlace(updated.id);
+      showToast(updated.textSource === "article" ? "文章内容已更新" : (updated.textSource === "note_tweet" ? "长推特内容已更新" : "推文内容已更新"));
+    }).catch(function (err) {
+      button.disabled = false;
+      button.querySelector("span").textContent = "重新获取内容";
+      handleError(err);
     });
   }
 
@@ -1554,6 +1674,10 @@
     }
     if (action === "sync-incremental") {
       runSync("incremental", false);
+      return;
+    }
+    if (action === "sync-resume") {
+      runSync("resume", false);
       return;
     }
     if (action === "sync-full") {

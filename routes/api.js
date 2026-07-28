@@ -11,8 +11,9 @@ var logger = require("../logger");
 var router = express.Router();
 var X_API_BASE = "https://api.x.com";
 var LONG_VIDEO_MS = 30000;
-var LIKED_TWEETS_INCREMENTAL_MAX_RESULTS = 5;
-var LIKED_TWEETS_FULL_MAX_RESULTS = 100;
+var LIKED_TWEETS_DEFAULT_MAX_RESULTS = 100;
+var LIKED_TWEETS_MIN_MAX_RESULTS = 5;
+var LIKED_TWEETS_MAX_MAX_RESULTS = 100;
 var LIKED_TWEETS_AUTH_TEST_MAX_RESULTS = 5;
 var TWEET_FIELDS = [
   "id",
@@ -53,6 +54,24 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function normalizeSyncPageSize(value) {
+  var pageSize = Number(value);
+  if (!isFinite(pageSize) || Math.floor(pageSize) !== pageSize || pageSize < LIKED_TWEETS_MIN_MAX_RESULTS || pageSize > LIKED_TWEETS_MAX_MAX_RESULTS) {
+    return LIKED_TWEETS_DEFAULT_MAX_RESULTS;
+  }
+  return pageSize;
+}
+
+function syncPageSizeFromInput(value) {
+  var pageSize = Number(value);
+  if (!isFinite(pageSize) || Math.floor(pageSize) !== pageSize || pageSize < LIKED_TWEETS_MIN_MAX_RESULTS || pageSize > LIKED_TWEETS_MAX_MAX_RESULTS) {
+    var err = new Error("每次请求数量必须是 5 到 100 之间的整数。");
+    err.statusCode = 400;
+    throw err;
+  }
+  return pageSize;
+}
+
 function getDb(req) {
   return req.app.locals.db;
 }
@@ -65,6 +84,7 @@ function getSettings(db) {
   if (!settings.tagSort) {
     settings.tagSort = "count";
   }
+  settings.syncPageSize = normalizeSyncPageSize(settings.syncPageSize);
   settings.accessToken = process.env.X_ACCESS_TOKEN || "";
   settings.refreshToken = process.env.X_REFRESH_TOKEN || "";
   settings.clientId = process.env.X_CLIENT_ID || "";
@@ -140,6 +160,7 @@ function publicSettings(settings) {
     name: settings.name || "",
     profileImageUrl: settings.profileImageUrl || "",
     autoSyncOnStart: !!settings.autoSyncOnStart,
+    syncPageSize: normalizeSyncPageSize(settings.syncPageSize),
     tagSort: settings.tagSort || "count",
     searchHistory: settings.searchHistory || [],
     lastAccountCheck: settings.lastAccountCheck || null
@@ -243,6 +264,7 @@ function xRequest(settings, method, pathname, params, responseType, db, retrying
     var wrapped = new Error(readXError(error));
     wrapped.statusCode = error.response && error.response.status ? error.response.status : 502;
     wrapped.detail = error.response && error.response.data ? error.response.data : null;
+    wrapped.rateLimit = error.response && error.response.headers ? rateLimitFromHeaders(error.response.headers) : null;
     throw wrapped;
   });
 }
@@ -563,6 +585,28 @@ function rateLimitFromHeaders(headers) {
     remaining: headers["x-rate-limit-remaining"] || "",
     reset: headers["x-rate-limit-reset"] || ""
   };
+}
+
+// The pagination token is an internal cursor and must not be exposed to the
+// browser. Only return the progress metadata required to render resume UI.
+function publicSyncState(sync) {
+  var result = Object.assign({}, sync || {});
+  var resume = result.resume;
+  if (resume && resume.paginationToken) {
+    result.resume = {
+      mode: resume.mode === "full" ? "full" : "incremental",
+      pageSize: normalizeSyncPageSize(resume.pageSize),
+      pages: Number(resume.pages || 0),
+      added: Number(resume.added || 0),
+      updated: Number(resume.updated || 0),
+      startedAt: resume.startedAt || "",
+      savedAt: resume.savedAt || "",
+      rateLimitReset: resume.rateLimitReset || ""
+    };
+  } else {
+    result.resume = null;
+  }
+  return result;
 }
 
 function sendOk(res, data) {
@@ -902,7 +946,7 @@ function refreshTweetFromX(settings, db, tweet) {
     var referencedById = indexBy(includes.tweets, "id");
     var incoming;
     if (!body.data || !body.data.id) {
-      var err = new Error("X API 没有返回推文媒体信息。");
+      var err = new Error("X API 没有返回推文内容。");
       err.statusCode = 502;
       throw err;
     }
@@ -919,7 +963,7 @@ function refreshTweetFromX(settings, db, tweet) {
 }
 
 function likedTweetParams(nextToken, maxResults) {
-  var pageSize = Number(maxResults || LIKED_TWEETS_FULL_MAX_RESULTS);
+  var pageSize = Number(maxResults || LIKED_TWEETS_DEFAULT_MAX_RESULTS);
   if (!pageSize || pageSize < 1) {
     pageSize = 1;
   }
@@ -1459,10 +1503,13 @@ function downloadTweetMedia(context, tweet, forceLong, job) {
   });
 }
 
-function syncLikedTweets(req, mode) {
+function syncLikedTweets(req, requestedMode) {
   var db = getDb(req);
   var settings = getSettings(db);
   var tweets = db.get("tweets").value();
+  var storedResume = db.get("sync.resume").value();
+  var isResume = requestedMode === "resume";
+  var mode = requestedMode === "full" ? "full" : "incremental";
   var existingIds = {};
   var nextToken = "";
   var pageCount = 0;
@@ -1472,17 +1519,69 @@ function syncLikedTweets(req, mode) {
   var startedAt = Date.now();
   var sequence = 0;
   var lastRateLimit = null;
-  var pageSize = mode === "incremental" ? LIKED_TWEETS_INCREMENTAL_MAX_RESULTS : LIKED_TWEETS_FULL_MAX_RESULTS;
+  var pageSize;
+
+  if (isResume) {
+    if (!storedResume || !storedResume.paginationToken) {
+      var missingResumeError = new Error("没有可继续的同步任务，请重新开始增量同步。");
+      missingResumeError.statusCode = 409;
+      return Promise.reject(missingResumeError);
+    }
+    mode = storedResume.mode === "full" ? "full" : "incremental";
+    nextToken = storedResume.paginationToken;
+    pageCount = Number(storedResume.pages || 0);
+    added = Number(storedResume.added || 0);
+    updated = Number(storedResume.updated || 0);
+    sequence = Number(storedResume.sequence || 0);
+    startedAt = Date.parse(storedResume.startedAt || "") || Date.now();
+    pageSize = normalizeSyncPageSize(storedResume.pageSize);
+    lastRateLimit = storedResume.lastRateLimit || null;
+    if (Number(storedResume.rateLimitReset || 0) * 1000 > Date.now()) {
+      var waitingError = new Error("速率限制尚未重置，请在提示时间后继续同步。");
+      waitingError.statusCode = 429;
+      waitingError.rateLimit = {
+        limit: lastRateLimit && lastRateLimit.limit ? lastRateLimit.limit : "",
+        remaining: "0",
+        reset: storedResume.rateLimitReset
+      };
+      return Promise.reject(waitingError);
+    }
+  } else if (req.body && typeof req.body.maxResults !== "undefined") {
+    pageSize = syncPageSizeFromInput(req.body.maxResults);
+    settings.syncPageSize = pageSize;
+    writeSettings(db, settings);
+  } else {
+    pageSize = normalizeSyncPageSize(settings.syncPageSize);
+  }
 
   safeArray(tweets).forEach(function (tweet) {
     existingIds[tweet.id] = true;
   });
 
   db.set("sync.lastMode", mode)
-    .set("sync.lastStartedAt", nowIso())
+    .set("sync.lastStartedAt", isResume ? (storedResume.startedAt || nowIso()) : nowIso())
+    .set("sync.lastAttemptAt", nowIso())
     .set("sync.lastFinishedAt", "")
     .set("sync.lastError", "")
+    .set("sync.lastErrorStatus", null)
+    .set("sync.resume", isResume ? storedResume : null)
     .write();
+
+  function resumeState(rateLimitReset) {
+    return {
+      mode: mode,
+      paginationToken: nextToken,
+      pageSize: pageSize,
+      pages: pageCount,
+      added: added,
+      updated: updated,
+      sequence: sequence,
+      startedAt: new Date(startedAt).toISOString(),
+      savedAt: nowIso(),
+      rateLimitReset: rateLimitReset || "",
+      lastRateLimit: lastRateLimit
+    };
+  }
 
   function nextPage() {
     requireUserId(settings);
@@ -1506,8 +1605,10 @@ function syncLikedTweets(req, mode) {
           updated += 1;
         }
       }
-      db.set("sync.lastRateLimit", lastRateLimit).write();
       nextToken = body.meta && body.meta.next_token ? body.meta.next_token : "";
+      db.set("sync.lastRateLimit", lastRateLimit)
+        .set("sync.resume", stoppedByDuplicate || !nextToken || pageCount >= 1000 ? null : resumeState(""))
+        .write();
       if (stoppedByDuplicate || !nextToken || pageCount >= 1000) {
         return null;
       }
@@ -1526,15 +1627,27 @@ function syncLikedTweets(req, mode) {
       stoppedByDuplicate: stoppedByDuplicate,
       maxResults: pageSize,
       rateLimit: lastRateLimit,
+      resumed: isResume,
       finishedAt: nowIso()
     };
     db.set("sync.lastFinishedAt", summary.finishedAt)
+      .set("sync.lastError", "")
+      .set("sync.lastErrorStatus", null)
       .set("sync.lastSummary", summary)
+      .set("sync.resume", null)
       .write();
     return summary;
   }).catch(function (err) {
+    var failedRateLimit = err.rateLimit || lastRateLimit;
+    var canResume = err.statusCode === 429 && !!nextToken;
+    if (failedRateLimit) {
+      lastRateLimit = failedRateLimit;
+    }
     db.set("sync.lastFinishedAt", nowIso())
       .set("sync.lastError", err.message || "同步失败")
+      .set("sync.lastErrorStatus", err.statusCode || 500)
+      .set("sync.lastRateLimit", lastRateLimit)
+      .set("sync.resume", canResume ? resumeState(lastRateLimit && lastRateLimit.reset ? lastRateLimit.reset : "") : null)
       .write();
     throw err;
   });
@@ -1551,7 +1664,7 @@ router.get("/status", function (req, res) {
       archivedTweets: tweets.filter(function (tweet) { return !!tweet.archived; }).length,
       taggedTweets: tweets.filter(function (tweet) { return safeArray(tweet.tags).length > 0; }).length
     },
-    sync: db.get("sync").value()
+    sync: publicSyncState(db.get("sync").value())
   });
 });
 
@@ -1569,6 +1682,9 @@ router.post("/settings", function (req, res) {
   }
   if (typeof body.autoSyncOnStart !== "undefined") {
     settings.autoSyncOnStart = !!body.autoSyncOnStart;
+  }
+  if (typeof body.syncPageSize !== "undefined") {
+    settings.syncPageSize = syncPageSizeFromInput(body.syncPageSize);
   }
   if (!settings.createdAt) {
     settings.createdAt = nowIso();
@@ -1601,7 +1717,8 @@ router.post("/auth/refresh", function (req, res, next) {
 });
 
 router.post("/sync", function (req, res, next) {
-  var mode = req.body && req.body.mode === "full" ? "full" : "incremental";
+  var requestedMode = req.body && req.body.mode;
+  var mode = requestedMode === "resume" ? "resume" : (requestedMode === "full" ? "full" : "incremental");
   syncLikedTweets(req, mode).then(function (summary) {
     sendOk(res, summary);
   }).catch(next);
@@ -1656,6 +1773,22 @@ router.post("/users/:id/refresh", function (req, res, next) {
   var settings = getSettings(db);
   fetchUserById(settings, db, req.params.id).then(function (user) {
     sendOk(res, updateTweetsForUser(db, settings, user));
+  }).catch(next);
+});
+
+// Re-fetch one Tweet so older database entries can gain long-form Note Tweet
+// or Article content without running a full liked-Tweets sync. Local metadata
+// such as rating, tags, note and archive state is preserved by applyIncomingTweet.
+router.post("/tweets/:id/refresh", function (req, res, next) {
+  var db = getDb(req);
+  var settings = getSettings(db);
+  var tweet = findTweet(db.get("tweets").value(), req.params.id);
+  if (!tweet) {
+    res.status(404).json({ ok: false, error: "推文不存在。" });
+    return;
+  }
+  refreshTweetFromX(settings, db, tweet).then(function (updatedTweet) {
+    sendOk(res, updatedTweet);
   }).catch(next);
 });
 

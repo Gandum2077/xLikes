@@ -229,6 +229,12 @@ button {
   font-weight: 600;
 }
 
+.field-help {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .field input,
 .field textarea,
 .field select {
@@ -244,6 +250,32 @@ button {
 .field textarea {
   min-height: 110px;
   resize: vertical;
+}
+
+.sync-page-size {
+  margin: 12px 0;
+}
+
+.sync-page-size input {
+  min-height: 44px;
+}
+
+.sync-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(244, 167, 33, 0.38);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(244, 167, 33, 0.12);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.sync-warning strong {
+  font-size: 14px;
 }
 
 .credential-block {
@@ -295,6 +327,7 @@ button {
 }
 
 .button {
+  min-height: 44px;
   border: 0;
   border-radius: 8px;
   padding: 10px 14px;

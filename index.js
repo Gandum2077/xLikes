@@ -38,6 +38,7 @@ db.defaults({
     name: "",
     profileImageUrl: "",
     autoSyncOnStart: false,
+    syncPageSize: 100,
     tagSort: "count",
     searchHistory: [],
     lastAccountCheck: null,
@@ -47,10 +48,13 @@ db.defaults({
   sync: {
     lastMode: "",
     lastStartedAt: "",
+    lastAttemptAt: "",
     lastFinishedAt: "",
     lastError: "",
+    lastErrorStatus: null,
     lastRateLimit: null,
-    lastSummary: null
+    lastSummary: null,
+    resume: null
   }
 }).write();
 
@@ -105,7 +109,8 @@ app.use(function (err, req, res, next) {
   res.status(status).json({
     ok: false,
     error: message,
-    detail: err.detail || null
+    detail: err.detail || null,
+    rateLimit: err.rateLimit || null
   });
 });
 
