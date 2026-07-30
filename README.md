@@ -16,7 +16,7 @@ xLikes 会把你点赞的推文同步到本地，变成你的个人知识库。
 
 ## 安装
 
-[JSBox 一键安装](https://xteko.com/redir?name=xLikes&url=https%3A%2F%2Fgithub.com%2FGandum2077%2FxLikes%2Freleases%2Fdownload%2F1.0.0%2FxLikes.box)
+[JSBox 一键安装](https://xteko.com/redir?name=xLikes&url=https%3A%2F%2Fgithub.com%2FGandum2077%2FxLikes%2Freleases%2Fdownload%2F1.1.0%2FxLikes.box)
 
 > 需要 JSBox 版本 >= 2.30.1，且购买了 Node.js 运行时功能
 
