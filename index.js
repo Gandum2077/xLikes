@@ -133,7 +133,7 @@ app.listen(PORT, HOST, () => {
           {
             type: "web",
             props: {
-              url: "${"http://" + HOST + ":" + PORT}"
+              url: "${"http://localhost:" + PORT}"
             },
             layout: $layout.fill
           }

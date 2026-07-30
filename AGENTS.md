@@ -93,12 +93,13 @@ app.listen(PORT, HOST, () => {
         props: {
           navBarHidden: true,
           statusBarStyle: 0,
+          theme: "auto",
         },
         views: [
           {
             type: "web",
             props: {
-              url: "${"http://" + HOST + ":" + PORT}"
+              url: "${"http://localhost:" + PORT}"
             },
             layout: $layout.fill
           }
