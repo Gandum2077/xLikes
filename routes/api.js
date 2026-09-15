@@ -249,6 +249,7 @@ function xRequest(settings, method, pathname, params, responseType, db, retrying
       headers: error.response && error.response.headers ? headersForLog(error.response.headers) : null,
       data: error.response && error.response.data ? error.response.data : null,
       message: error.message,
+      code: error.code || null,
       willAttemptRefresh: willAttemptRefresh
     });
     if (willAttemptRefresh) {
@@ -271,7 +272,18 @@ function xRequest(settings, method, pathname, params, responseType, db, retrying
 
 function readXError(error) {
   if (!error.response) {
-    return "无法连接 X API，请检查网络、Token 或 JSBox 网络权限。";
+    // Transport failures happen before an HTTP authentication response arrives.
+    // Keep these separate from 401 errors so users do not rotate valid tokens.
+    if (error.code === "ETIMEDOUT" || error.code === "ECONNABORTED") {
+      return "连接 X API 超时，未收到 HTTP 响应。请检查运行应用的设备网络、代理/VPN 分流和 JSBox 网络权限，并确认与 Postman 使用相同的网络路径。此错误不能说明 Token 无效。";
+    }
+    if (error.code === "ENOTFOUND" || error.code === "EAI_AGAIN") {
+      return "无法解析 X API 域名，请检查运行应用的设备 DNS、网络和代理/VPN 配置。";
+    }
+    if (error.code === "ECONNRESET" || error.code === "ECONNREFUSED") {
+      return "X API 连接被重置或拒绝，请检查运行应用的设备网络及代理/VPN 配置。";
+    }
+    return "无法连接 X API，未收到 HTTP 响应。请检查运行应用的设备网络、代理/VPN 和 JSBox 网络权限。";
   }
   var data = error.response.data || {};
   var status = error.response.status;
@@ -444,7 +456,7 @@ function refreshAccessToken(settings, db) {
     }
     return settings;
   }).catch(function (error) {
-    var message = error.response ? readXError(error) : error.message;
+    var message = error.response || error.request || error.code ? readXError(error) : error.message;
     logger.error("xauth.refresh.error", {
       id: requestId,
       durationMs: Date.now() - startedAt,
