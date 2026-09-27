@@ -1074,6 +1074,18 @@ function tweetMatchesMediaDownload(tweet, mode) {
   return tweetMediaDownloadState(tweet) === normalized;
 }
 
+// Multiple media types are alternatives; an empty selection leaves search unrestricted.
+function tweetMatchesMediaTypes(tweet, types) {
+  return !types.length || types.some(function (type) {
+    if (type === "article") {
+      return !!(tweet.hasArticle || tweet.article || tweet.textSource === "article");
+    }
+    return safeArray(tweet.media).some(function (media) {
+      return media && (type === "photo" ? media.type === "photo" : media.type === "video" || media.type === "animated_gif");
+    });
+  });
+}
+
 function tagCounts(tweets) {
   var counts = {};
   safeArray(tweets).forEach(function (tweet) {
@@ -1897,6 +1909,65 @@ router.post("/tweets/:id/media/download", function (req, res, next) {
   });
 });
 
+// Remove only manually downloaded long videos, preserving their remote metadata.
+router.delete("/tweets/:id/media/videos", function (req, res, next) {
+  var db = getDb(req);
+  var tweet = findTweet(db.get("tweets").value(), req.params.id);
+  if (!tweet) {
+    res.status(404).json({ ok: false, error: "推文不存在。" });
+    return;
+  }
+  var key = mediaDownloadKey(tweet.id);
+  var job = mediaDownloadJobs[key];
+  if (job && (job.status === "queued" || job.status === "downloading")) {
+    res.status(409).json({ ok: false, error: "媒体正在下载，请下载结束后再删除。" });
+    return;
+  }
+  var videos = safeArray(tweet.media).filter(function (media) {
+    return media && media.type === "video" && media.durationMs > LONG_VIDEO_MS && media.localPath;
+  });
+  var changed = false;
+  try {
+    var mediaDir = path.resolve(req.app.locals.mediaDir);
+    // Validate every path before deleting; local media files live directly in mediaDir.
+    var files = videos.map(function (media) {
+      var localPath = String(media.localPath);
+      var fileName = localPath.slice("/media/".length);
+      if (localPath.indexOf("/media/") !== 0 || !fileName || fileName === "." || fileName === ".." || fileName.indexOf("/") !== -1 || fileName.indexOf("\\") !== -1) {
+        throw new Error("本地视频路径无效，无法删除。");
+      }
+      return path.join(mediaDir, fileName);
+    });
+    try {
+      videos.forEach(function (media, index) {
+        try {
+          fs.unlinkSync(files[index]);
+        } catch (err) {
+          // A missing file should still have its stale database record cleared.
+          if (err.code !== "ENOENT") {
+            throw err;
+          }
+        }
+        media.localPath = "";
+        media.downloadedAt = "";
+        media.status = "deferred";
+        media.error = "";
+        changed = true;
+      });
+    } finally {
+      // Persist successful removals even if another file cannot be deleted.
+      if (changed) {
+        delete mediaDownloadJobs[key];
+        tweet.localUpdatedAt = nowIso();
+        db.write();
+      }
+    }
+    sendOk(res, tweet);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/tweets/:id/media/progress", function (req, res) {
   var db = getDb(req);
   var tweet = findTweet(db.get("tweets").value(), req.params.id);
@@ -1940,6 +2011,9 @@ router.post("/search", function (req, res) {
   var q = String(body.q || "").trim();
   var sortMode = body.sort === "reverse" || body.sort === "random" || body.sort === "created_asc" || body.sort === "created_desc" ? body.sort : "normal";
   var mediaDownloaded = body.mediaDownloaded === "yes" || body.mediaDownloaded === "no" ? body.mediaDownloaded : "";
+  var mediaTypes = safeArray(body.mediaTypes).filter(function (type) {
+    return type === "photo" || type === "video" || type === "article";
+  });
   var startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.startDate || "")) ? String(body.startDate) : "";
   var endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(body.endDate || "")) ? String(body.endDate) : "";
   var randomSeed = String(body.randomSeed || "");
@@ -1951,7 +2025,7 @@ router.post("/search", function (req, res) {
     writeSettings(db, settings);
   }
   var all = sortSearchTweets(db.get("tweets").value().filter(function (tweet) {
-    return tweetMatches(tweet, q, includeArchived, minRating) && tweetMatchesMediaDownload(tweet, mediaDownloaded) && tweetInDateRange(tweet, startDate, endDate);
+    return tweetMatches(tweet, q, includeArchived, minRating) && tweetMatchesMediaDownload(tweet, mediaDownloaded) && tweetMatchesMediaTypes(tweet, mediaTypes) && tweetInDateRange(tweet, startDate, endDate);
   }), sortMode, randomSeed);
   sendOk(res, {
     items: all.slice(offset, offset + limit),
@@ -1962,6 +2036,7 @@ router.post("/search", function (req, res) {
     history: settings.searchHistory,
     sort: sortMode,
     mediaDownloaded: mediaDownloaded,
+    mediaTypes: mediaTypes,
     randomSeed: randomSeed
   });
 });

@@ -30,6 +30,7 @@
     syncing: false,
     autoSyncTried: false,
     downloading: {},
+    deletingVideos: {},
     downloadProgress: {},
     pendingMediaRenders: {},
     scrollQuietUntil: 0,
@@ -39,6 +40,7 @@
       includeArchived: false,
       minRating: 0,
       mediaDownloaded: "",
+      mediaTypes: [],
       sort: "normal",
       startDate: "",
       endDate: "",
@@ -866,7 +868,7 @@
   }
 
   function downloadMedia(id, forceLong, refreshRemote) {
-    if (state.downloading[id]) {
+    if (state.downloading[id] || state.deletingVideos[id]) {
       return;
     }
     state.downloading[id] = true;
@@ -1067,6 +1069,12 @@
         '<div class="field" style="margin-top:0"><label>是否完成媒体下载</label><select id="searchMediaDownloaded">',
         mediaDownloadedOptions(state.search.mediaDownloaded),
         "</select></div>",
+        '<fieldset id="searchMediaTypes" class="media-type-filter"><legend>包含媒体类型</legend>',
+        '<div class="media-type-options">',
+        [["photo", "图片"], ["video", "视频"], ["article", "文章"]].map(function (item) {
+          return '<label><input type="checkbox" value="' + item[0] + '" ' + (state.search.mediaTypes.indexOf(item[0]) !== -1 ? "checked" : "") + '><span>' + item[1] + '</span></label>';
+        }).join(""),
+        '</div><div class="inline-muted">可多选，匹配任一类型；不选则不限</div></fieldset>',
         '<div class="field" style="margin-top:0"><label>搜索结果排序</label><select id="searchSort">',
         searchSortOptions(state.search.sort),
         "</select></div>",
@@ -1197,6 +1205,7 @@
     var archived = document.getElementById("searchArchived");
     var rating = document.getElementById("searchRating");
     var mediaDownloaded = document.getElementById("searchMediaDownloaded");
+    var mediaTypes = document.getElementById("searchMediaTypes");
     var sort = document.getElementById("searchSort");
     var startDate = document.getElementById("searchStartDate");
     var endDate = document.getElementById("searchEndDate");
@@ -1204,6 +1213,12 @@
     state.search.includeArchived = archived ? archived.checked : state.search.includeArchived;
     state.search.minRating = rating ? Number(rating.value || 0) : state.search.minRating;
     state.search.mediaDownloaded = mediaDownloaded ? mediaDownloaded.value : state.search.mediaDownloaded;
+    // Keep the selection when controls are hidden during pagination.
+    if (mediaTypes) {
+      state.search.mediaTypes = Array.prototype.map.call(mediaTypes.querySelectorAll("input:checked"), function (input) {
+        return input.value;
+      });
+    }
     state.search.sort = sort ? sort.value : state.search.sort;
     state.search.startDate = startDate ? startDate.value : state.search.startDate;
     state.search.endDate = endDate ? endDate.value : state.search.endDate;
@@ -1227,6 +1242,7 @@
       includeArchived: state.search.includeArchived,
       minRating: state.search.minRating,
       mediaDownloaded: state.search.mediaDownloaded,
+      mediaTypes: state.search.mediaTypes,
       sort: state.search.sort,
       startDate: state.search.startDate,
       endDate: state.search.endDate,
@@ -1497,6 +1513,9 @@
 
   function showTweetMenu(tweet) {
     var archivedText = tweet.archived ? "取消归档" : "归档";
+    var hasLocalLongVideo = (tweet.media || []).some(function (media) {
+      return media.type === "video" && media.durationMs > 30000 && media.localPath;
+    });
     showModal([
       "<h3>更多</h3>",
       '<div class="list">',
@@ -1504,6 +1523,7 @@
       '<button class="list-row" type="button" id="archiveTweet"><span>' + archivedText + "</span></button>",
       '<button class="list-row" type="button" id="showMetrics"><span>查看数据</span></button>',
       '<button class="list-row" type="button" id="refreshAuthor"><span>刷新用户名和头像</span></button>',
+      hasLocalLongVideo ? '<button class="list-row" type="button" id="deleteLocalVideos" ' + (state.downloading[tweet.id] || state.deletingVideos[tweet.id] ? "disabled" : "") + '><span>删除本地视频文件</span></button>' : "",
       "</div>",
       '<p class="inline-muted">重新从 X 获取正文、长推特或文章、引用、数据和媒体信息；评分、标签、备注与归档状态会保留。</p>',
       '<div class="modal-actions"><button class="button ghost" type="button" data-modal-close>关闭</button></div>'
@@ -1524,6 +1544,41 @@
       document.getElementById("refreshAuthor").onclick = function () {
         refreshTweetAuthor(tweet);
       };
+      var deleteButton = document.getElementById("deleteLocalVideos");
+      if (deleteButton) {
+        deleteButton.onclick = function () {
+          deleteLocalVideos(tweet, this);
+        };
+      }
+    });
+  }
+
+  function deleteLocalVideos(tweet, button) {
+    if (button.disabled || state.downloading[tweet.id] || state.deletingVideos[tweet.id]) {
+      return;
+    }
+    button.disabled = true;
+    button.querySelector("span").textContent = "正在删除...";
+    state.deletingVideos[tweet.id] = true;
+    axios.delete("/api/tweets/" + encodeURIComponent(tweet.id) + "/media/videos").then(readApiResponse).then(function (updated) {
+      delete state.deletingVideos[tweet.id];
+      clearProgressTimer(tweet.id);
+      delete state.downloadProgress[tweet.id];
+      updateTweetInState(updated);
+      closeModal();
+      renderTweetInPlace(tweet.id);
+      showToast("本地长视频文件已删除，可随时重新下载");
+    }).catch(function (err) {
+      delete state.deletingVideos[tweet.id];
+      button.disabled = false;
+      button.querySelector("span").textContent = "删除本地视频文件";
+      handleError(err);
+      // Reconcile the card if only some files could be removed.
+      apiGet("/api/tweets/" + encodeURIComponent(tweet.id) + "/media/progress").then(function (data) {
+        updateTweetInState(data.tweet);
+        state.downloadProgress[tweet.id] = data.progress;
+        renderTweetWhenIdle(tweet.id);
+      }).catch(handleError);
     });
   }
 
