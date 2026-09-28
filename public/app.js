@@ -12,6 +12,7 @@
   var toastTimer = null;
   var progressTimers = {};
   var mediaRenderFlushTimer = null;
+  var mediaScrollPositions = {};
   var SCROLL_RENDER_DEFER_MS = 900;
 
   var state = {
@@ -730,10 +731,18 @@
     if (!media.length) {
       return "";
     }
-    var html = ['<div class="media-grid count-' + Math.min(media.length, 4) + '">'];
-    media.forEach(function (item) {
+    var carousel = media.length > 1 ? window.mediaCarouselLayout(media) : null;
+    var html = ['<div class="media-grid' + (carousel ? ' media-carousel' : '') + '">'];
+    if (carousel) {
+      html.push('<div class="media-sizer" style="padding-bottom:calc(' + (carousel.height * 100).toFixed(4) + '% - ' + Math.abs(carousel.offset).toFixed(3) + 'px)"><div class="media-track" tabindex="0" role="group" aria-label="推文媒体" data-tweet-id="' + escapeHtml(tweet.id) + '">');
+    }
+    media.forEach(function (item, index) {
       var display = mediaDisplayInfo(item);
       var progress = mediaProgressForItem(tweet.id, item);
+      if (carousel) {
+        display.className = "media-fit-cover";
+        display.style = "flex-basis:calc(" + (carousel.height * carousel.aspects[index] * 100).toFixed(4) + "% - " + Math.abs(carousel.offset * carousel.aspects[index]).toFixed(3) + "px);";
+      }
       html.push('<div class="media-item ' + display.className + '" style="' + display.style + '" data-media-status="' + escapeHtml(item.status || "") + '">');
       if (item.localPath) {
         if (item.type === "video" || item.type === "animated_gif") {
@@ -755,6 +764,15 @@
       }
       html.push("</div>");
     });
+    if (carousel) {
+      html.push('</div></div>');
+      [-1, 1].forEach(function (direction) {
+        var label = direction < 0 ? "上一项媒体" : "下一项媒体";
+        // Lucide chevron icons, matching the existing inline icon approach.
+        var points = direction < 0 ? "15 18 9 12 15 6" : "9 18 15 12 9 6";
+        html.push('<button class="media-nav ' + (direction < 0 ? 'media-prev' : 'media-next') + '" type="button" data-action="scroll-media" data-direction="' + direction + '" aria-label="' + label + '" title="' + label + '"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="' + points + '"></polyline></svg></button>');
+      });
+    }
     html.push("</div>");
     return html.join("");
   }
@@ -825,6 +843,7 @@
   }
 
   function setupMediaObserver() {
+    setupMediaCarousels(appEl);
     if (mediaObserver) {
       mediaObserver.disconnect();
     }
@@ -846,6 +865,34 @@
     for (var j = 0; j < cards.length; j += 1) {
       mediaObserver.observe(cards[j]);
     }
+  }
+
+  function updateMediaNavigation(track) {
+    var gallery = track.parentNode.parentNode;
+    gallery.querySelector(".media-prev").disabled = track.scrollLeft <= 1;
+    gallery.querySelector(".media-next").disabled = track.scrollLeft >= track.scrollWidth - track.clientWidth - 1;
+  }
+
+  function setupMediaCarousels(root) {
+    var tracks = root.querySelectorAll(".media-track");
+    for (var i = 0; i < tracks.length; i += 1) {
+      tracks[i].scrollLeft = mediaScrollPositions[tracks[i].getAttribute("data-tweet-id")] || 0;
+      updateMediaNavigation(tracks[i]);
+    }
+  }
+
+  function scrollMedia(track, direction) {
+    var items = track.children;
+    var left = track.scrollLeft;
+    var destination = direction > 0 ? track.scrollWidth : 0;
+    for (var i = 0; i < items.length; i += 1) {
+      var position = items[i].offsetLeft - items[0].offsetLeft;
+      if (direction > 0 && position > left + 2) { destination = position; break; }
+      if (direction < 0 && position < left - 2) { destination = position; }
+    }
+    var reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (track.scrollTo) { track.scrollTo({ left: destination, behavior: reducedMotion ? "auto" : "smooth" }); }
+    else { track.scrollLeft = destination; }
   }
 
   function autoDownloadForCard(card) {
@@ -1374,6 +1421,7 @@
     holder.innerHTML = renderTweetCard(tweet);
     nextCard = holder.firstChild;
     card.parentNode.replaceChild(nextCard, card);
+    setupMediaCarousels(nextCard);
     restoreScrollPosition(scrollX, scrollY);
   }
 
@@ -1771,6 +1819,10 @@
       downloadMedia(id, action === "download-long", action === "retry-media" && target.getAttribute("data-refresh-remote") === "true");
       return;
     }
+    if (action === "scroll-media") {
+      scrollMedia(target.parentNode.querySelector(".media-track"), Number(target.getAttribute("data-direction")));
+      return;
+    }
     if (action === "image-viewer") {
       showImageViewer(target.getAttribute("data-src"), target.getAttribute("data-alt"), target.getAttribute("data-ratio"));
       return;
@@ -1819,6 +1871,25 @@
   }
 
   function bindEvents() {
+    // Capture nested scrolling so background downloads wait for horizontal gestures too.
+    appEl.addEventListener("scroll", function (event) {
+      var track = event.target;
+      if (!track.classList || !track.classList.contains("media-track")) { return; }
+      mediaScrollPositions[track.getAttribute("data-tweet-id")] = track.scrollLeft;
+      updateMediaNavigation(track);
+      markScrollActive();
+    }, true);
+    appEl.addEventListener("keydown", function (event) {
+      if (!event.target.classList.contains("media-track")) { return; }
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        scrollMedia(event.target, event.key === "ArrowLeft" ? -1 : 1);
+      }
+    });
+    window.addEventListener("resize", function () {
+      var tracks = appEl.querySelectorAll(".media-track");
+      for (var i = 0; i < tracks.length; i += 1) { updateMediaNavigation(tracks[i]); }
+    });
     tabbarEl.onclick = function (event) {
       var button = closestAction(event.target);
       if (button) {
