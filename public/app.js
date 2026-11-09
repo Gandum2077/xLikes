@@ -343,7 +343,7 @@
       return '<p class="inline-muted">上次同步失败：' + escapeHtml(sync.lastError) + "</p>";
     }
     if (!sync || !sync.lastSummary) {
-      return '<p class="inline-muted">尚未同步。增量同步遇到本地重复推文后停止；完全同步会批量遍历全部可访问点赞。</p>';
+      return '<p class="inline-muted">尚未同步。增量同步会核对点赞顺序，确认接上上次的记录后停止。完全同步会批量遍历全部可访问点赞。</p>';
     }
     var s = sync.lastSummary;
     return '<p class="inline-muted">上次' + (s.mode === "full" ? "完全" : "增量") + "同步：新增 " + s.added + "，更新 " + s.updated + "，页数 " + s.pages + (s.maxResults ? "，每次读取 " + s.maxResults + " 条" : "") + "。</p>";

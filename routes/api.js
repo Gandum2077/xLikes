@@ -42,6 +42,7 @@ var TWEET_EXPANSIONS = [
   "referenced_tweets.id.attachments.media_keys"
 ].join(",");
 var mediaDownloadJobs = {};
+var activeSyncs = new WeakSet();
 var CREDENTIAL_ENV_KEYS = {
   accessToken: "X_ACCESS_TOKEN",
   refreshToken: "X_REFRESH_TOKEN",
@@ -604,6 +605,7 @@ function rateLimitFromHeaders(headers) {
 function publicSyncState(sync) {
   var result = Object.assign({}, sync || {});
   var resume = result.resume;
+  delete result.incrementalBoundary;
   if (resume && resume.paginationToken) {
     result.resume = {
       mode: resume.mode === "full" ? "full" : "incremental",
@@ -1534,7 +1536,8 @@ function syncLikedTweets(req, requestedMode) {
   var storedResume = db.get("sync.resume").value();
   var isResume = requestedMode === "resume";
   var mode = requestedMode === "full" ? "full" : "incremental";
-  var existingIds = {};
+  var boundary = db.get("sync.incrementalBoundary").value();
+  var pendingBoundary = null;
   var nextToken = "";
   var pageCount = 0;
   var added = 0;
@@ -1560,6 +1563,7 @@ function syncLikedTweets(req, requestedMode) {
     startedAt = Date.parse(storedResume.startedAt || "") || Date.now();
     pageSize = normalizeSyncPageSize(storedResume.pageSize);
     lastRateLimit = storedResume.lastRateLimit || null;
+    pendingBoundary = storedResume.pendingBoundary || null;
     if (Number(storedResume.rateLimitReset || 0) * 1000 > Date.now()) {
       var waitingError = new Error("速率限制尚未重置，请在提示时间后继续同步。");
       waitingError.statusCode = 429;
@@ -1578,9 +1582,17 @@ function syncLikedTweets(req, requestedMode) {
     pageSize = normalizeSyncPageSize(settings.syncPageSize);
   }
 
-  safeArray(tweets).forEach(function (tweet) {
-    existingIds[tweet.id] = true;
-  });
+  if (mode === "incremental" && !Array.isArray(boundary)) {
+    // sortOrder records the previous X list order. A legacy resume has
+    // already written part of its prefix, so it must scan without a boundary.
+    boundary = isResume ? [] : safeArray(tweets).filter(function (tweet) {
+      return Number.isFinite(tweet.sortOrder);
+    }).sort(function (a, b) {
+      return b.sortOrder - a.sortOrder;
+    }).slice(0, 2).map(function (tweet) {
+      return tweet.id;
+    });
+  }
 
   db.set("sync.lastMode", mode)
     .set("sync.lastStartedAt", isResume ? (storedResume.startedAt || nowIso()) : nowIso())
@@ -1589,6 +1601,7 @@ function syncLikedTweets(req, requestedMode) {
     .set("sync.lastError", "")
     .set("sync.lastErrorStatus", null)
     .set("sync.resume", isResume ? storedResume : null)
+    .set("sync.incrementalBoundary", boundary || null)
     .write();
 
   function resumeState(rateLimitReset) {
@@ -1600,11 +1613,22 @@ function syncLikedTweets(req, requestedMode) {
       added: added,
       updated: updated,
       sequence: sequence,
+      pendingBoundary: pendingBoundary,
       startedAt: new Date(startedAt).toISOString(),
       savedAt: nowIso(),
       rateLimitReset: rateLimitReset || "",
       lastRateLimit: lastRateLimit
     };
+  }
+
+  function saveTweet(incoming) {
+    var result = upsertTweet(tweets, incoming, startedAt * 1000 - sequence);
+    sequence += 1;
+    if (result === "added") {
+      added += 1;
+    } else {
+      updated += 1;
+    }
   }
 
   function nextPage() {
@@ -1616,20 +1640,28 @@ function syncLikedTweets(req, requestedMode) {
       var list = normalizeLikedResponse(body);
       for (var i = 0; i < list.length; i += 1) {
         var incoming = list[i];
-        if (mode === "incremental" && existingIds[incoming.id]) {
-          stoppedByDuplicate = true;
-          break;
+        // X supplies list order but no like timestamp. Require the prior
+        // leading pair in order, even when split across two pages.
+        if (pendingBoundary) {
+          if (incoming.id === boundary[1]) {
+            pendingBoundary = null;
+            stoppedByDuplicate = true;
+            break;
+          }
+          saveTweet(pendingBoundary);
+          pendingBoundary = null;
         }
-        var result = upsertTweet(tweets, incoming, startedAt * 1000 - sequence);
-        sequence += 1;
-        existingIds[incoming.id] = true;
-        if (result === "added") {
-          added += 1;
+        if (mode === "incremental" && boundary.length === 2 && incoming.id === boundary[0]) {
+          pendingBoundary = incoming;
         } else {
-          updated += 1;
+          saveTweet(incoming);
         }
       }
       nextToken = body.meta && body.meta.next_token ? body.meta.next_token : "";
+      if (pendingBoundary && (!nextToken || pageCount >= 1000)) {
+        saveTweet(pendingBoundary);
+        pendingBoundary = null;
+      }
       db.set("sync.lastRateLimit", lastRateLimit)
         .set("sync.resume", stoppedByDuplicate || !nextToken || pageCount >= 1000 ? null : resumeState(""))
         .write();
@@ -1659,6 +1691,7 @@ function syncLikedTweets(req, requestedMode) {
       .set("sync.lastErrorStatus", null)
       .set("sync.lastSummary", summary)
       .set("sync.resume", null)
+      .set("sync.incrementalBoundary", null)
       .write();
     return summary;
   }).catch(function (err) {
@@ -1741,11 +1774,24 @@ router.post("/auth/refresh", function (req, res, next) {
 });
 
 router.post("/sync", function (req, res, next) {
+  var db = getDb(req);
+  if (activeSyncs.has(db)) {
+    var err = new Error("同步正在进行，请等待当前任务完成。");
+    err.statusCode = 409;
+    return next(err);
+  }
   var requestedMode = req.body && req.body.mode;
   var mode = requestedMode === "resume" ? "resume" : (requestedMode === "full" ? "full" : "incremental");
-  syncLikedTweets(req, mode).then(function (summary) {
+  activeSyncs.add(db);
+  Promise.resolve().then(function () {
+    return syncLikedTweets(req, mode);
+  }).then(function (summary) {
+    activeSyncs.delete(db);
     sendOk(res, summary);
-  }).catch(next);
+  }, function (err) {
+    activeSyncs.delete(db);
+    next(err);
+  });
 });
 
 router.get("/tweets", function (req, res) {
