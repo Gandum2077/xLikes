@@ -15,6 +15,10 @@ var LIKED_TWEETS_DEFAULT_MAX_RESULTS = 100;
 var LIKED_TWEETS_MIN_MAX_RESULTS = 5;
 var LIKED_TWEETS_MAX_MAX_RESULTS = 100;
 var LIKED_TWEETS_AUTH_TEST_MAX_RESULTS = 5;
+var INCREMENTAL_SYNC_VERSION = 2;
+// Follow new likes automatically; cap unusual runs before they scan history.
+var INCREMENTAL_SYNC_MAX_PAGES = 10;
+var FULL_SYNC_MAX_PAGES = 1000;
 var TWEET_FIELDS = [
   "id",
   "text",
@@ -615,12 +619,21 @@ function publicSyncState(sync) {
       updated: Number(resume.updated || 0),
       startedAt: resume.startedAt || "",
       savedAt: resume.savedAt || "",
-      rateLimitReset: resume.rateLimitReset || ""
+      rateLimitReset: resume.rateLimitReset || "",
+      pauseReason: resume.pauseReason || "rate_limit",
+      maxPagesPerRun: resume.mode === "full" ? FULL_SYNC_MAX_PAGES : INCREMENTAL_SYNC_MAX_PAGES,
+      restartRequired: resume.mode !== "full" && !isCurrentIncrementalResume(resume)
     };
   } else {
     result.resume = null;
   }
   return result;
+}
+
+// Older checkpoints relied on a fragile leading pair. Never continue their
+// deep cursor: the saved local records are enough to check the first page anew.
+function isCurrentIncrementalResume(resume) {
+  return resume.version === INCREMENTAL_SYNC_VERSION && Array.isArray(resume.knownTweetIds);
 }
 
 function sendOk(res, data) {
@@ -1536,17 +1549,38 @@ function syncLikedTweets(req, requestedMode) {
   var storedResume = db.get("sync.resume").value();
   var isResume = requestedMode === "resume";
   var mode = requestedMode === "full" ? "full" : "incremental";
-  var boundary = db.get("sync.incrementalBoundary").value();
-  var pendingBoundary = null;
+  var restartedFromLegacy = false;
+  var knownTweetIds = null;
+  var pendingKnownTweet = null;
   var nextToken = "";
+  var visitedPaginationTokens = [""];
   var pageCount = 0;
+  var pagesThisRun = 0;
   var added = 0;
   var updated = 0;
   var stoppedByDuplicate = false;
+  var pauseReason = "";
   var startedAt = Date.now();
   var sequence = 0;
   var lastRateLimit = null;
   var pageSize;
+  var savedRateLimit = db.get("sync.lastRateLimit").value() || {};
+  var waitingReset = storedResume && storedResume.rateLimitReset ? storedResume.rateLimitReset : "";
+  if ((String(savedRateLimit.remaining) === "0" || Number(db.get("sync.lastErrorStatus").value()) === 429) && Number(savedRateLimit.reset || 0) > Number(waitingReset || 0)) {
+    waitingReset = savedRateLimit.reset;
+  }
+  // Starting a new mode must not bypass an already known reset time. This also
+  // protects the first-page 429 case, where no pagination checkpoint exists.
+  if (Number(waitingReset) * 1000 > Date.now()) {
+    var waitingError = new Error("速率限制尚未重置，请在提示时间后同步。");
+    waitingError.statusCode = 429;
+    waitingError.rateLimit = {
+      limit: savedRateLimit.limit || "",
+      remaining: "0",
+      reset: waitingReset
+    };
+    return Promise.reject(waitingError);
+  }
 
   if (isResume) {
     if (!storedResume || !storedResume.paginationToken) {
@@ -1555,24 +1589,24 @@ function syncLikedTweets(req, requestedMode) {
       return Promise.reject(missingResumeError);
     }
     mode = storedResume.mode === "full" ? "full" : "incremental";
-    nextToken = storedResume.paginationToken;
-    pageCount = Number(storedResume.pages || 0);
-    added = Number(storedResume.added || 0);
-    updated = Number(storedResume.updated || 0);
-    sequence = Number(storedResume.sequence || 0);
-    startedAt = Date.parse(storedResume.startedAt || "") || Date.now();
-    pageSize = normalizeSyncPageSize(storedResume.pageSize);
     lastRateLimit = storedResume.lastRateLimit || null;
-    pendingBoundary = storedResume.pendingBoundary || null;
-    if (Number(storedResume.rateLimitReset || 0) * 1000 > Date.now()) {
-      var waitingError = new Error("速率限制尚未重置，请在提示时间后继续同步。");
-      waitingError.statusCode = 429;
-      waitingError.rateLimit = {
-        limit: lastRateLimit && lastRateLimit.limit ? lastRateLimit.limit : "",
-        remaining: "0",
-        reset: storedResume.rateLimitReset
-      };
-      return Promise.reject(waitingError);
+    restartedFromLegacy = mode === "incremental" && !isCurrentIncrementalResume(storedResume);
+    if (!restartedFromLegacy) {
+      nextToken = storedResume.paginationToken;
+      pageCount = Number(storedResume.pages || 0);
+      added = Number(storedResume.added || 0);
+      updated = Number(storedResume.updated || 0);
+      sequence = Number(storedResume.sequence || 0);
+      startedAt = Date.parse(storedResume.startedAt || "") || Date.now();
+      pageSize = normalizeSyncPageSize(storedResume.pageSize);
+      knownTweetIds = storedResume.knownTweetIds;
+      pendingKnownTweet = storedResume.pendingKnownTweet || null;
+      visitedPaginationTokens = safeArray(storedResume.visitedPaginationTokens).slice();
+      if (visitedPaginationTokens.indexOf(nextToken) === -1) {
+        visitedPaginationTokens.push(nextToken);
+      }
+    } else {
+      pageSize = normalizeSyncPageSize(settings.syncPageSize);
     }
   } else if (req.body && typeof req.body.maxResults !== "undefined") {
     pageSize = syncPageSizeFromInput(req.body.maxResults);
@@ -1582,43 +1616,54 @@ function syncLikedTweets(req, requestedMode) {
     pageSize = normalizeSyncPageSize(settings.syncPageSize);
   }
 
-  if (mode === "incremental" && !Array.isArray(boundary)) {
-    // sortOrder records the previous X list order. A legacy resume has
-    // already written part of its prefix, so it must scan without a boundary.
-    boundary = isResume ? [] : safeArray(tweets).filter(function (tweet) {
-      return Number.isFinite(tweet.sortOrder);
-    }).sort(function (a, b) {
-      return b.sortOrder - a.sortOrder;
-    }).slice(0, 2).map(function (tweet) {
-      return tweet.id;
+  if (mode === "incremental" && !Array.isArray(knownTweetIds)) {
+    // Freeze membership before writing this run. Newly saved records must not
+    // become false duplicates when a later page or manual resume repeats them.
+    knownTweetIds = safeArray(tweets).map(function (tweet) {
+      return String(tweet.id);
     });
   }
+  var knownIds = new Set(knownTweetIds || []);
+  var duplicateThreshold = Math.min(2, knownIds.size);
+  var maxPagesPerRun = mode === "incremental" ? INCREMENTAL_SYNC_MAX_PAGES : FULL_SYNC_MAX_PAGES;
 
   db.set("sync.lastMode", mode)
-    .set("sync.lastStartedAt", isResume ? (storedResume.startedAt || nowIso()) : nowIso())
+    .set("sync.lastStartedAt", new Date(startedAt).toISOString())
     .set("sync.lastAttemptAt", nowIso())
     .set("sync.lastFinishedAt", "")
     .set("sync.lastError", "")
     .set("sync.lastErrorStatus", null)
-    .set("sync.resume", isResume ? storedResume : null)
-    .set("sync.incrementalBoundary", boundary || null)
+    .set("sync.resume", isResume && !restartedFromLegacy ? storedResume : null)
+    .set("sync.incrementalBoundary", null)
     .write();
 
-  function resumeState(rateLimitReset) {
+  function resumeState(rateLimitReset, reason) {
     return {
+      version: INCREMENTAL_SYNC_VERSION,
       mode: mode,
       paginationToken: nextToken,
+      visitedPaginationTokens: visitedPaginationTokens,
       pageSize: pageSize,
       pages: pageCount,
       added: added,
       updated: updated,
       sequence: sequence,
-      pendingBoundary: pendingBoundary,
+      knownTweetIds: mode === "incremental" ? knownTweetIds : null,
+      pendingKnownTweet: pendingKnownTweet,
       startedAt: new Date(startedAt).toISOString(),
       savedAt: nowIso(),
       rateLimitReset: rateLimitReset || "",
+      pauseReason: reason || "page_limit",
       lastRateLimit: lastRateLimit
     };
+  }
+
+  function checkpoint() {
+    var canResume = !stoppedByDuplicate && !!nextToken && pauseReason !== "pagination_stalled";
+    var reset = pauseReason === "rate_limit" && lastRateLimit ? lastRateLimit.reset : "";
+    db.set("sync.lastRateLimit", lastRateLimit)
+      .set("sync.resume", canResume ? resumeState(reset, pauseReason) : null)
+      .write();
   }
 
   function saveTweet(incoming) {
@@ -1635,37 +1680,60 @@ function syncLikedTweets(req, requestedMode) {
     requireUserId(settings);
     return xRequest(settings, "get", "/2/users/" + encodeURIComponent(settings.userId) + "/liked_tweets", likedTweetParams(nextToken, pageSize), null, db).then(function (response) {
       pageCount += 1;
+      pagesThisRun += 1;
       lastRateLimit = rateLimitFromHeaders(response.headers);
       var body = response.data || {};
       var list = normalizeLikedResponse(body);
       for (var i = 0; i < list.length; i += 1) {
         var incoming = list[i];
-        // X supplies list order but no like timestamp. Require the prior
-        // leading pair in order, even when split across two pages.
-        if (pendingBoundary) {
-          if (incoming.id === boundary[1]) {
-            pendingBoundary = null;
+        var isKnown = mode === "incremental" && knownIds.has(String(incoming.id));
+        // A single re-liked record may precede new likes. Two distinct known
+        // records in succession reconnect to local history, regardless of the
+        // old leading pair's current availability or order.
+        if (pendingKnownTweet) {
+          if (String(incoming.id) === String(pendingKnownTweet.id)) {
+            continue;
+          }
+          if (isKnown) {
+            pendingKnownTweet = null;
             stoppedByDuplicate = true;
             break;
           }
-          saveTweet(pendingBoundary);
-          pendingBoundary = null;
+          saveTweet(pendingKnownTweet);
+          pendingKnownTweet = null;
         }
-        if (mode === "incremental" && boundary.length === 2 && incoming.id === boundary[0]) {
-          pendingBoundary = incoming;
+        if (isKnown) {
+          pendingKnownTweet = incoming;
         } else {
           saveTweet(incoming);
         }
       }
-      nextToken = body.meta && body.meta.next_token ? body.meta.next_token : "";
-      if (pendingBoundary && (!nextToken || pageCount >= 1000)) {
-        saveTweet(pendingBoundary);
-        pendingBoundary = null;
+      // With just one local record, inspect the rest of the fetched page before
+      // stopping so a re-like at the front cannot hide new items later in it.
+      if (duplicateThreshold === 1 && pendingKnownTweet) {
+        pendingKnownTweet = null;
+        stoppedByDuplicate = true;
       }
-      db.set("sync.lastRateLimit", lastRateLimit)
-        .set("sync.resume", stoppedByDuplicate || !nextToken || pageCount >= 1000 ? null : resumeState(""))
-        .write();
-      if (stoppedByDuplicate || !nextToken || pageCount >= 1000) {
+      nextToken = body.meta && body.meta.next_token ? body.meta.next_token : "";
+      if (!stoppedByDuplicate && nextToken) {
+        // Never follow repeated cursors or empty pages into a billing loop.
+        if (!list.length || visitedPaginationTokens.indexOf(nextToken) !== -1) {
+          pauseReason = "pagination_stalled";
+        } else {
+          visitedPaginationTokens.push(nextToken);
+          if (lastRateLimit && String(lastRateLimit.remaining) === "0") {
+            pauseReason = "rate_limit";
+          } else if (pagesThisRun >= maxPagesPerRun) {
+            pauseReason = "page_limit";
+          }
+        }
+      }
+      if (pendingKnownTweet && (!nextToken || pauseReason === "pagination_stalled")) {
+        saveTweet(pendingKnownTweet);
+        pendingKnownTweet = null;
+      }
+      checkpoint();
+      if (stoppedByDuplicate || !nextToken || pauseReason) {
         return null;
       }
       return nextPage();
@@ -1681,22 +1749,26 @@ function syncLikedTweets(req, requestedMode) {
       added: added,
       updated: updated,
       stoppedByDuplicate: stoppedByDuplicate,
+      paused: !!pauseReason,
+      pauseReason: pauseReason,
+      pagesThisRun: pagesThisRun,
+      maxPagesPerRun: maxPagesPerRun,
       maxResults: pageSize,
       rateLimit: lastRateLimit,
-      resumed: isResume,
+      resumed: isResume && !restartedFromLegacy,
+      restartedFromLegacy: restartedFromLegacy,
       finishedAt: nowIso()
     };
     db.set("sync.lastFinishedAt", summary.finishedAt)
       .set("sync.lastError", "")
       .set("sync.lastErrorStatus", null)
       .set("sync.lastSummary", summary)
-      .set("sync.resume", null)
       .set("sync.incrementalBoundary", null)
       .write();
     return summary;
   }).catch(function (err) {
     var failedRateLimit = err.rateLimit || lastRateLimit;
-    var canResume = err.statusCode === 429 && !!nextToken;
+    var canResume = !!nextToken && !stoppedByDuplicate && pauseReason !== "pagination_stalled";
     if (failedRateLimit) {
       lastRateLimit = failedRateLimit;
     }
@@ -1704,7 +1776,7 @@ function syncLikedTweets(req, requestedMode) {
       .set("sync.lastError", err.message || "同步失败")
       .set("sync.lastErrorStatus", err.statusCode || 500)
       .set("sync.lastRateLimit", lastRateLimit)
-      .set("sync.resume", canResume ? resumeState(lastRateLimit && lastRateLimit.reset ? lastRateLimit.reset : "") : null)
+      .set("sync.resume", canResume ? resumeState(err.statusCode === 429 && lastRateLimit ? lastRateLimit.reset : "", err.statusCode === 429 ? "rate_limit" : "request_error") : null)
       .write();
     throw err;
   });

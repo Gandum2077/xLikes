@@ -160,6 +160,18 @@
     return !!(resume && Number(resume.rateLimitReset || 0) * 1000 > Date.now());
   }
 
+  function syncWaitingReset(sync) {
+    sync = sync || {};
+    if (resumeIsWaiting(sync.resume)) {
+      return sync.resume.rateLimitReset;
+    }
+    var rateLimit = sync.lastRateLimit || {};
+    if ((String(rateLimit.remaining) === "0" || Number(sync.lastErrorStatus) === 429) && Number(rateLimit.reset || 0) * 1000 > Date.now()) {
+      return rateLimit.reset;
+    }
+    return "";
+  }
+
   function pad(value) {
     return value < 10 ? "0" + value : String(value);
   }
@@ -255,8 +267,7 @@
     }
     var sync = data.sync || {};
     var resume = sync.resume || null;
-    var syncAction = resume ? "sync-resume" : "sync-incremental";
-    var syncLabel = resume ? "继续同步" : "增量同步";
+    var resumeLabel = resume && resume.mode === "full" ? "继续完全同步" : "继续增量同步";
     appEl.innerHTML = [
       '<section class="panel">',
       '<div class="row between">',
@@ -278,10 +289,11 @@
       '<div class="field sync-page-size">',
       '<label for="syncPageSizeInput">每次请求数量</label>',
       '<input id="syncPageSizeInput" type="number" inputmode="numeric" min="5" max="100" step="1" value="' + escapeHtml(settings.syncPageSize || 100) + '" ' + (state.syncing ? "disabled" : "") + ">",
-      '<span class="field-help">可填写 5–100。数值越大，获取相同数量推文需要的请求次数越少；继续同步会沿用断点保存的数量。</span>',
+      '<span class="field-help">可填写 5–100。增量同步会自动翻页，接上已有记录后停止；每次操作最多读取 10 页，达到保护上限才暂停。继续同步沿用断点保存的每页数量。</span>',
       "</div>",
       '<div class="row">',
-      '<button class="button" type="button" data-action="' + syncAction + '" ' + (state.syncing ? "disabled" : "") + ">" + syncLabel + "</button>",
+      '<button class="button" type="button" data-action="sync-incremental" ' + (state.syncing ? "disabled" : "") + ">增量同步</button>",
+      resume && !resume.restartRequired ? '<button class="button secondary" type="button" data-action="sync-resume" ' + (state.syncing ? "disabled" : "") + ">" + resumeLabel + "</button>" : "",
       '<button class="button secondary" type="button" data-action="sync-full" ' + (state.syncing ? "disabled" : "") + ">完全同步</button>",
       "</div>",
       syncHtml(sync),
@@ -326,13 +338,30 @@
     }
     if (sync && sync.resume) {
       var resume = sync.resume;
-      var resetText = formatRateLimitReset(resume.rateLimitReset);
-      var timingText = resumeIsWaiting(resume) ? "请在 " + resetText + " 后点击继续同步。" : "速率限制预计已重置，可以继续同步。";
+      var taskName = resume.mode === "full" ? "完全同步" : "增量同步";
+      var title = taskName + "已暂停";
+      var timingText = "请处理上次错误后手动继续。";
+      var maxPages = resume.maxPagesPerRun || (resume.mode === "full" ? 1000 : 10);
+      if (resume.pauseReason === "page_limit") {
+        timingText = "已达到本次 " + maxPages + " 页的保护上限。" + (resume.mode === "full" ? "继续读取历史点赞需要手动确认。" : "点击“继续增量同步”可继续自动翻页，接上已有记录后停止。");
+      } else if (resume.pauseReason === "pagination_stalled") {
+        timingText = "接口分页未推进，已停止继续请求。可点击“增量同步”从首页重新检查。";
+      } else if (resume.pauseReason === "rate_limit") {
+        timingText = "请确认额度或速率限制已恢复后，再手动继续。";
+      }
+      if (resume.restartRequired) {
+        title = "旧版增量任务已暂停";
+        timingText = "点击“增量同步”会从首页重新检查旧任务，并自动翻页至接上已有记录；每次最多读取 " + maxPages + " 页。";
+      }
+      if (resumeIsWaiting(resume)) {
+        timingText += " 请在 " + formatRateLimitReset(resume.rateLimitReset) + " 后操作。";
+      }
       return [
         '<div class="sync-warning" role="status">',
-        '<strong>同步已暂停，可从断点继续</strong>',
-        '<span>已完成 ' + escapeHtml(String(resume.pages || 0)) + " 页，新增 " + escapeHtml(String(resume.added || 0)) + " 条，更新 " + escapeHtml(String(resume.updated || 0)) + " 条；断点每次读取 " + escapeHtml(String(resume.pageSize || 0)) + " 条。</span>",
+        '<strong>' + escapeHtml(title) + "</strong>",
+        '<span>此任务累计读取 ' + escapeHtml(String(resume.pages || 0)) + " 页，新增 " + escapeHtml(String(resume.added || 0)) + " 条，更新 " + escapeHtml(String(resume.updated || 0)) + " 条；断点每页读取 " + escapeHtml(String(resume.pageSize || 0)) + " 条。</span>",
         '<span>' + escapeHtml(timingText) + "</span>",
+        resume.restartRequired ? "" : '<span>“增量同步”会放弃旧断点，从首页检查最新点赞。已有本地推文会保留。</span>',
         "</div>"
       ].join("");
     }
@@ -343,10 +372,11 @@
       return '<p class="inline-muted">上次同步失败：' + escapeHtml(sync.lastError) + "</p>";
     }
     if (!sync || !sync.lastSummary) {
-      return '<p class="inline-muted">尚未同步。增量同步会核对点赞顺序，确认接上上次的记录后停止。完全同步会批量遍历全部可访问点赞。</p>';
+      return '<p class="inline-muted">尚未同步。增量同步会自动翻页，遇到连续两条本轮开始前已有的推文时停止；每次最多读取 10 页。完全同步会批量遍历全部可访问点赞。</p>';
     }
     var s = sync.lastSummary;
-    return '<p class="inline-muted">上次' + (s.mode === "full" ? "完全" : "增量") + "同步：新增 " + s.added + "，更新 " + s.updated + "，页数 " + s.pages + (s.maxResults ? "，每次读取 " + s.maxResults + " 条" : "") + "。</p>";
+    var pauseText = s.pauseReason === "pagination_stalled" ? " 接口分页未推进，已停止请求；请点击“增量同步”从首页重新检查。" : "";
+    return '<p class="inline-muted">上次' + (s.mode === "full" ? "完全" : "增量") + "同步" + (s.paused ? "已暂停" : "完成") + "：新增 " + s.added + "，更新 " + s.updated + "，页数 " + s.pages + (s.maxResults ? "，每页读取 " + s.maxResults + " 条" : "") + (s.restartedFromLegacy ? "；已从首页重新检查旧版断点" : "") + "。" + pauseText + "</p>";
   }
 
   function renderSetup(settings) {
@@ -476,17 +506,23 @@
       return;
     }
     state.autoSyncTried = true;
-    var resume = state.status && state.status.sync ? state.status.sync.resume : null;
-    if (resume && resumeIsWaiting(resume)) {
+    var sync = state.status && state.status.sync ? state.status.sync : {};
+    // A saved task always requires an explicit choice, especially a full sync.
+    if (sync.resume || syncWaitingReset(sync)) {
       return;
     }
-    runSync(resume ? "resume" : "incremental", true);
+    runSync("incremental", true);
   }
 
   function runSync(mode, silent) {
     var payload = { mode: mode };
     var pageSizeInput = document.getElementById("syncPageSizeInput");
     if (state.syncing) {
+      return;
+    }
+    var waitingReset = syncWaitingReset(state.status && state.status.sync);
+    if (waitingReset) {
+      showToast("请在 " + formatRateLimitReset(waitingReset) + " 后同步");
       return;
     }
     if (mode === "resume") {
@@ -509,7 +545,7 @@
     apiPost("/api/sync", payload).then(function (summary) {
       state.syncing = false;
       if (!silent) {
-        showToast("同步完成：新增 " + summary.added + "，更新 " + summary.updated);
+        showToast((summary.restartedFromLegacy ? "已从首页重新检查；" : "") + (summary.paused ? "同步已暂停：新增 " : "同步完成：新增 ") + summary.added + "，更新 " + summary.updated);
       }
       return apiGet("/api/status");
     }).then(function (data) {
@@ -534,21 +570,22 @@
     });
   }
 
-  function confirmFullSync() {
+  function confirmFullSync(mode) {
     if (state.syncing) {
       return;
     }
+    var isResume = mode === "resume";
     showModal([
-      "<h3>确认完全同步</h3>",
-      '<p class="inline-muted">完全同步会从 X API 批量读取全部可访问点赞列表，可能消耗较多接口额度。确认继续吗？</p>',
+      "<h3>" + (isResume ? "确认继续完全同步" : "确认完全同步") + "</h3>",
+      '<p class="inline-muted">' + (isResume ? "这会从历史断点继续完全同步，批量读取后续可访问点赞。" : "完全同步会从 X API 批量读取全部可访问点赞列表。") + "可能消耗较多接口额度。确认继续吗？</p>",
       '<div class="modal-actions">',
       '<button class="button ghost" type="button" data-modal-close>取消</button>',
-      '<button class="button danger" type="button" id="confirmFullSync">开始完全同步</button>',
+      '<button class="button danger" type="button" id="confirmFullSync">' + (isResume ? "继续完全同步" : "开始完全同步") + "</button>",
       "</div>"
     ].join(""), function () {
       document.getElementById("confirmFullSync").onclick = function () {
         closeModal();
-        runSync("full", false);
+        runSync(isResume ? "resume" : "full", false);
       };
     });
   }
@@ -1780,7 +1817,12 @@
       return;
     }
     if (action === "sync-resume") {
-      runSync("resume", false);
+      var resume = state.status && state.status.sync ? state.status.sync.resume : null;
+      if (resume && resume.mode === "full") {
+        confirmFullSync("resume");
+      } else {
+        runSync("resume", false);
+      }
       return;
     }
     if (action === "sync-full") {
