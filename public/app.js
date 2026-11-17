@@ -13,6 +13,7 @@
   var progressTimers = {};
   var mediaRenderFlushTimer = null;
   var mediaScrollPositions = {};
+  var imageViewerCleanup = null;
   var SCROLL_RENDER_DEFER_MS = 900;
 
   var state = {
@@ -1758,6 +1759,7 @@
   }
 
   function showModal(html, afterRender) {
+    closeModal();
     modalRootEl.innerHTML = '<div class="modal-backdrop"><div class="modal">' + html + "</div></div>";
     var backdrop = modalRootEl.querySelector(".modal-backdrop");
     var modal = modalRootEl.querySelector(".modal");
@@ -1773,29 +1775,149 @@
 
   function closeModal() {
     modalRootEl.innerHTML = "";
+    if (imageViewerCleanup) {
+      imageViewerCleanup();
+      imageViewerCleanup = null;
+    }
   }
 
-  function showImageViewer(src, alt, ratioValue) {
-    var ratio = Number(ratioValue || 1);
-    var imageClass = "image-viewer-img";
-    if (ratio < 0.5) {
-      imageClass += " tall";
-    } else if (ratio > 2) {
-      imageClass += " wide";
-    }
+  function showImageViewer(target) {
+    // Snapshot this tweet's available images so background card renders cannot
+    // change the order while viewing. Videos and download placeholders are skipped.
+    var gallery = target.closest(".media-grid");
+    var thumbnails = gallery ? gallery.querySelectorAll('img[data-action="image-viewer"]') : [target];
+    var images = Array.prototype.map.call(thumbnails, function (image) {
+      return {
+        src: image.getAttribute("data-src"),
+        alt: image.getAttribute("data-alt") || "",
+        ratio: Number(image.getAttribute("data-ratio") || 1)
+      };
+    });
+    var index = Array.prototype.indexOf.call(thumbnails, target);
+    if (index < 0) { return; }
+    closeModal();
+    var previousFocus = document.activeElement;
+    var gesture = null;
+    var ignoreClickUntil = 0;
     modalRootEl.innerHTML = [
-      '<div class="image-viewer-backdrop">',
-      '<div class="image-viewer-stage">',
-      '<img class="' + imageClass + '" src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt || "") + '">',
-      "</div>",
+      '<div class="image-viewer-backdrop" role="dialog" aria-modal="true" aria-label="图片预览" tabindex="-1">',
+      '<div class="image-viewer-counter" aria-live="polite" aria-atomic="true"></div>',
+      '<button class="image-viewer-control image-viewer-close" type="button" data-action="close-image-viewer" aria-label="关闭图片预览"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"></path></svg></button>',
+      '<div class="image-viewer-stage"></div>',
+      '<button class="image-viewer-control image-viewer-prev" type="button" data-action="previous-image" aria-label="上一张图片"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg></button>',
+      '<button class="image-viewer-control image-viewer-next" type="button" data-action="next-image" aria-label="下一张图片"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg></button>',
       "</div>"
     ].join("");
     var backdrop = modalRootEl.querySelector(".image-viewer-backdrop");
+    var stage = backdrop.querySelector(".image-viewer-stage");
+    var counter = backdrop.querySelector(".image-viewer-counter");
+    var previous = backdrop.querySelector(".image-viewer-prev");
+    var next = backdrop.querySelector(".image-viewer-next");
+    var close = backdrop.querySelector(".image-viewer-close");
+
+    function renderImage() {
+      var item = images[index];
+      var imageClass = "image-viewer-img";
+      if (item.ratio < 0.5) { imageClass += " tall"; }
+      else if (item.ratio > 2) { imageClass += " wide"; }
+      stage.innerHTML = '<img class="' + imageClass + '" src="' + escapeHtml(item.src) + '" alt="' + escapeHtml(item.alt) + '" draggable="false">';
+      stage.scrollTop = 0;
+      stage.scrollLeft = 0;
+      counter.textContent = (index + 1) + " / " + images.length;
+      previous.hidden = next.hidden = images.length < 2;
+      previous.disabled = index === 0;
+      next.disabled = index === images.length - 1;
+      if ((document.activeElement === previous && previous.disabled) || (document.activeElement === next && next.disabled)) {
+        backdrop.focus();
+      }
+    }
+
+    function turnImage(direction) {
+      var destination = index + direction;
+      if (destination < 0 || destination >= images.length) { return; }
+      index = destination;
+      renderImage();
+    }
+
     backdrop.onclick = function (event) {
-      if (event.target === backdrop) {
+      if (Date.now() < ignoreClickUntil) { return; }
+      var button = closestAction(event.target);
+      var action = button ? button.getAttribute("data-action") : "";
+      if (event.target === backdrop || action === "close-image-viewer") {
         closeModal();
+      } else if (action === "previous-image" || action === "next-image") {
+        turnImage(action === "previous-image" ? -1 : 1);
       }
     };
+    backdrop.onkeydown = function (event) {
+      if (event.key === "Escape") { event.preventDefault(); closeModal(); }
+      else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        turnImage(event.key === "ArrowLeft" ? -1 : 1);
+      } else if (event.key === "Tab") {
+        var first = close;
+        var last = !next.hidden && !next.disabled ? next : (!previous.hidden && !previous.disabled ? previous : close);
+        if (event.shiftKey && (document.activeElement === first || document.activeElement === backdrop)) {
+          event.preventDefault(); last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === backdrop)) {
+          event.preventDefault(); first.focus();
+        }
+      }
+    };
+
+    function isZoomed(event) {
+      return event.scale && event.scale !== 1 || window.visualViewport && window.visualViewport.scale > 1;
+    }
+
+    // Only claim a single-finger horizontal gesture. A wide image keeps its
+    // native panning until a new gesture starts at the corresponding edge.
+    backdrop.addEventListener("touchstart", function (event) {
+      gesture = null;
+      if (event.touches.length !== 1 || closestAction(event.target) || isZoomed(event)) { return; }
+      gesture = {
+        x: event.touches[0].clientX,
+        y: event.touches[0].clientY,
+        axis: "",
+        scrollLeft: stage.scrollLeft,
+        scrollMax: stage.contains(event.target) ? stage.scrollWidth - stage.clientWidth : 0,
+        canTurn: false
+      };
+    }, { passive: true });
+    backdrop.addEventListener("touchmove", function (event) {
+      if (!gesture) { return; }
+      if (event.touches.length !== 1 || isZoomed(event)) { gesture = null; return; }
+      var dx = event.touches[0].clientX - gesture.x;
+      var dy = event.touches[0].clientY - gesture.y;
+      if (!gesture.axis && Math.max(Math.abs(dx), Math.abs(dy)) > 10) {
+        gesture.axis = Math.abs(dx) > Math.abs(dy) * 1.5 ? "x" : "y";
+        gesture.canTurn = gesture.scrollMax <= 1 || (dx > 0 ? gesture.scrollLeft <= 1 : gesture.scrollLeft >= gesture.scrollMax - 1);
+      }
+      if (gesture.axis === "x" && gesture.canTurn && event.cancelable) { event.preventDefault(); }
+      if (gesture.axis) { ignoreClickUntil = Date.now() + 400; }
+    }, { passive: false });
+    backdrop.addEventListener("touchend", function (event) {
+      var finished = gesture;
+      gesture = null;
+      if (!finished || event.touches.length || !event.changedTouches.length || isZoomed(event)) { return; }
+      var dx = event.changedTouches[0].clientX - finished.x;
+      var dy = event.changedTouches[0].clientY - finished.y;
+      var atEdge = finished.scrollMax <= 1 || (dx > 0 ? finished.scrollLeft <= 1 : finished.scrollLeft >= finished.scrollMax - 1);
+      if (finished.axis === "x" && finished.canTurn && atEdge && Math.abs(dx) >= 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        ignoreClickUntil = Date.now() + 400;
+        turnImage(dx < 0 ? 1 : -1);
+      }
+    }, { passive: true });
+    backdrop.addEventListener("touchcancel", function () { gesture = null; }, { passive: true });
+
+    document.body.classList.add("image-viewer-open");
+    imageViewerCleanup = function () {
+      document.body.classList.remove("image-viewer-open");
+      if (previousFocus && previousFocus !== document.body && document.body.contains(previousFocus)) {
+        previousFocus.focus();
+      }
+    };
+    renderImage();
+    close.focus();
   }
 
   function onAction(action, target) {
@@ -1866,7 +1988,7 @@
       return;
     }
     if (action === "image-viewer") {
-      showImageViewer(target.getAttribute("data-src"), target.getAttribute("data-alt"), target.getAttribute("data-ratio"));
+      showImageViewer(target);
       return;
     }
     var tweet = findTweetInState(id);

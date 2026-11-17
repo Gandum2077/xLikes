@@ -828,13 +828,73 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 18px;
+  padding: calc(60px + var(--safe-top)) 18px calc(18px + var(--safe-bottom));
   background: rgba(0, 0, 0, 0.78);
 }
 
+body.image-viewer-open {
+  overflow: hidden;
+}
+
+.image-viewer-control {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+}
+
+.image-viewer-control[hidden] {
+  display: none;
+}
+
+.image-viewer-control:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.image-viewer-control:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+.image-viewer-close {
+  top: calc(8px + var(--safe-top));
+  right: calc(12px + env(safe-area-inset-right, 0px));
+}
+
+.image-viewer-prev,
+.image-viewer-next {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.image-viewer-prev { left: calc(8px + env(safe-area-inset-left, 0px)); }
+.image-viewer-next { right: calc(8px + env(safe-area-inset-right, 0px)); }
+
+.image-viewer-counter {
+  position: absolute;
+  top: calc(16px + var(--safe-top));
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  border-radius: 16px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
 .image-viewer-stage {
-  max-width: calc(100vw - 36px);
-  max-height: calc(100vh - 36px);
+  max-width: 100%;
+  max-height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
 }
@@ -842,7 +902,7 @@ button {
 .image-viewer-img {
   display: block;
   max-width: 100%;
-  max-height: calc(100vh - 36px);
+  max-height: calc(100vh - 78px - var(--safe-top) - var(--safe-bottom));
   margin: auto;
   border-radius: 8px;
 }
@@ -855,7 +915,7 @@ button {
 }
 
 .image-viewer-img.wide {
-  height: min(720px, calc(100vh - 36px));
+  height: min(720px, calc(100vh - 78px - var(--safe-top) - var(--safe-bottom)));
   max-width: none;
   max-height: none;
   width: auto;
